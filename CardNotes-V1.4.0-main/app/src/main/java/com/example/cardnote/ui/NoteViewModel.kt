@@ -9,10 +9,17 @@ import com.example.cardnote.data.*
 import com.example.cardnote.util.ImageStorageManager
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.FlowPreview
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.File
+import java.util.UUID
+import java.util.zip.ZipEntry
+import java.util.zip.ZipInputStream
+import java.util.zip.ZipOutputStream
 import kotlin.math.max
 
 // ── 筛选状态 ──
@@ -64,7 +71,7 @@ data class NoteImportDraft(
     val isDownloaded: Boolean,
     val remarks: String,
     val categoryName: String?,
-    val imagesBase64: List<String> = emptyList()
+    val imageBytesList: List<ByteArray> = emptyList()
 )
 
 enum class ConflictType { NONE, EXACT, SIMILAR }
@@ -99,6 +106,8 @@ private data class QueryKey(val categoryIds: List<Long>?, val filter: FilterStat
 class NoteViewModel(application: Application) : AndroidViewModel(application) {
     companion object {
         private const val SIMILARITY_THRESHOLD = 0.78
+        private const val EXPORT_NOTES_JSON = "notes.json"
+        private const val EXPORT_ASSETS_DIR = "assets/"
     }
 
     private val noteRepo: NoteRepository
@@ -538,10 +547,21 @@ class NoteViewModel(application: Application) : AndroidViewModel(application) {
                 walk(categories)
 
                 val notesArray = JSONArray()
+                val exportedImagePathMap = mutableMapOf<String, String>()
                 allNotes.forEach { note ->
-                    val encodedImages = buildList {
+                    val exportedImages = buildList {
                         for (path in note.images) {
-                            ImageStorageManager.readImageAsBase64(path)?.let { add(it) }
+                            val existing = exportedImagePathMap[path]
+                            if (existing != null) {
+                                add(existing)
+                                continue
+                            }
+                            val sourceFile = File(path)
+                            if (!sourceFile.exists() || !sourceFile.isFile) continue
+                            val extension = sourceFile.extension.takeIf { it.isNotBlank() } ?: "jpg"
+                            val entryName = "${EXPORT_ASSETS_DIR}${UUID.randomUUID()}.$extension"
+                            exportedImagePathMap[path] = entryName
+                            add(entryName)
                         }
                     }
                     notesArray.put(
@@ -551,17 +571,29 @@ class NoteViewModel(application: Application) : AndroidViewModel(application) {
                             put("isDownloaded", note.isDownloaded)
                             put("remarks", note.remarks)
                             put("categoryName", note.categoryId?.let { categoryNameById[it] })
-                            put("imagesBase64", JSONArray(encodedImages))
+                            put("images", JSONArray(exportedImages))
                         }
                     )
                 }
                 val payload = JSONObject().apply {
-                    put("schemaVersion", 1)
+                    put("schemaVersion", 2)
                     put("exportedAt", System.currentTimeMillis())
                     put("notes", notesArray)
                 }
-                appCtx.contentResolver.openOutputStream(uri)?.use { out ->
-                    out.write(payload.toString(2).toByteArray(Charsets.UTF_8))
+                appCtx.contentResolver.openOutputStream(uri)?.use { outStream ->
+                    ZipOutputStream(outStream).use { zipOut ->
+                        zipOut.putNextEntry(ZipEntry(EXPORT_NOTES_JSON))
+                        zipOut.write(payload.toString(2).toByteArray(Charsets.UTF_8))
+                        zipOut.closeEntry()
+
+                        exportedImagePathMap.forEach { (sourcePath, entryName) ->
+                            val file = File(sourcePath)
+                            if (!file.exists() || !file.isFile) return@forEach
+                            zipOut.putNextEntry(ZipEntry(entryName))
+                            file.inputStream().use { it.copyTo(zipOut) }
+                            zipOut.closeEntry()
+                        }
+                    }
                 } ?: error("无法写入导出文件")
             }.onSuccess {
                 _uiState.update { it.copy(snackbarMessage = "导出成功") }
@@ -574,10 +606,10 @@ class NoteViewModel(application: Application) : AndroidViewModel(application) {
     fun parseImportFile(uri: Uri) {
         viewModelScope.launch {
             runCatching {
-                val text = appCtx.contentResolver.openInputStream(uri)?.bufferedReader()?.use { it.readText() }
-                    ?: error("无法读取导入文件")
-                val root = JSONObject(text)
-                val notes = root.optJSONArray("notes") ?: JSONArray()
+                val importPayload = appCtx.contentResolver.openInputStream(uri)?.use { input ->
+                    readImportPayloadFromZip(input)
+                } ?: error("无法读取导入文件")
+                val notes = importPayload.root.optJSONArray("notes") ?: JSONArray()
                 val existed = noteRepo.getAllNotesSnapshot()
                 val importItems = mutableListOf<ImportReviewItem>()
                 for (i in 0 until notes.length()) {
@@ -588,11 +620,13 @@ class NoteViewModel(application: Application) : AndroidViewModel(application) {
                         isDownloaded = obj.optBoolean("isDownloaded", false),
                         remarks = obj.optString("remarks", "").trim(),
                         categoryName = obj.optString("categoryName", "").trim().ifBlank { null },
-                        imagesBase64 = buildList {
-                            val arr = obj.optJSONArray("imagesBase64") ?: JSONArray()
+                        imageBytesList = buildList {
+                            val arr = obj.optJSONArray("images") ?: JSONArray()
                             for (j in 0 until arr.length()) {
-                                val encoded = arr.optString(j).trim()
-                                if (encoded.isNotEmpty()) add(encoded)
+                                val entryName = arr.optString(j).trim()
+                                if (entryName.isNotEmpty()) {
+                                    importPayload.assets[entryName]?.let { add(it) }
+                                }
                             }
                         }
                     )
@@ -678,10 +712,11 @@ class NoteViewModel(application: Application) : AndroidViewModel(application) {
                     val key = name.trim()
                     categoryMap[key] ?: catRepo.insert(CategoryEntity(name = key)).also { categoryMap[key] = it }
                 }
-                val importedImagePaths = ImageStorageManager.writeBase64ImagesToPrivateStorage(
+                val binaryImportedPaths = writeRawImagesToPrivateStorage(
                     context = appCtx,
-                    base64List = item.draft.imagesBase64
+                    imageBytesList = item.draft.imageBytesList
                 )
+                val finalImagePaths = binaryImportedPaths
                 val existing = noteRepo.getAllNotesSnapshot().firstOrNull {
                     normalizeName(it.name) == normalizeName(item.draft.name)
                 }
@@ -693,7 +728,7 @@ class NoteViewModel(application: Application) : AndroidViewModel(application) {
                             url = item.draft.url,
                             isDownloaded = item.draft.isDownloaded,
                             remarks = item.draft.remarks,
-                            images = importedImagePaths,
+                            images = finalImagePaths,
                             categoryId = categoryId
                         )
                     )
@@ -704,7 +739,7 @@ class NoteViewModel(application: Application) : AndroidViewModel(application) {
                             url = item.draft.url,
                             isDownloaded = item.draft.isDownloaded,
                             remarks = item.draft.remarks,
-                            images = importedImagePaths,
+                            images = finalImagePaths,
                             categoryId = categoryId
                         )
                     )
@@ -721,4 +756,46 @@ class NoteViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun clearSnackbar() { _uiState.update { it.copy(snackbarMessage = null) } }
+
+    private data class ImportPayload(
+        val root: JSONObject,
+        val assets: Map<String, ByteArray>
+    )
+
+    private suspend fun readImportPayloadFromZip(inputStream: java.io.InputStream): ImportPayload =
+        withContext(Dispatchers.IO) {
+            ZipInputStream(inputStream).use { zipIn ->
+                val assets = mutableMapOf<String, ByteArray>()
+                var notesJsonText: String? = null
+                var entry = zipIn.nextEntry
+                while (entry != null) {
+                    if (!entry.isDirectory) {
+                        val bytes = zipIn.readBytes()
+                        if (entry.name == EXPORT_NOTES_JSON) {
+                            notesJsonText = bytes.toString(Charsets.UTF_8)
+                        } else if (entry.name.startsWith(EXPORT_ASSETS_DIR)) {
+                            assets[entry.name] = bytes
+                        }
+                    }
+                    zipIn.closeEntry()
+                    entry = zipIn.nextEntry
+                }
+                val root = JSONObject(notesJsonText ?: error("压缩包中缺少 $EXPORT_NOTES_JSON"))
+                ImportPayload(root = root, assets = assets)
+            }
+        }
+
+    private suspend fun writeRawImagesToPrivateStorage(
+        context: Context,
+        imageBytesList: List<ByteArray>
+    ): List<String> = withContext(Dispatchers.IO) {
+        val dir = File(context.filesDir, "note_images").also { it.mkdirs() }
+        imageBytesList.mapNotNull { bytes ->
+            runCatching {
+                val file = File(dir, "${UUID.randomUUID()}.jpg")
+                file.outputStream().use { it.write(bytes) }
+                file.absolutePath
+            }.getOrNull()
+        }
+    }
 }
