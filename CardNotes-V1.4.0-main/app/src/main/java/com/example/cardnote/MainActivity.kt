@@ -222,6 +222,29 @@ fun CardNoteApp(vm: NoteViewModel = viewModel()) {
             onConfirm = vm::confirmImportSelected
         )
     }
+    uiState.duplicateNameDialogMessage?.let { msg ->
+        AlertDialog(
+            onDismissRequest = vm::clearDuplicateNameDialog,
+            containerColor = Color(0xFF1E1E2E),
+            shape = RoundedCornerShape(16.dp),
+            title = { Text("保存失败", color = Color.White, fontWeight = FontWeight.Bold) },
+            text = { Text(msg, color = Color(0xFFCCCCDD)) },
+            confirmButton = {
+                Button(
+                    onClick = if (uiState.duplicateNameCanForceSave) vm::confirmForceSaveDuplicateName else vm::clearDuplicateNameDialog,
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF6C63FF)),
+                    shape = RoundedCornerShape(10.dp)
+                ) { Text(if (uiState.duplicateNameCanForceSave) "仍然保存" else "知道了") }
+            },
+            dismissButton = if (uiState.duplicateNameCanForceSave) {
+                {
+                    TextButton(onClick = vm::clearDuplicateNameDialog) {
+                        Text("取消", color = Color(0xFF8888AA))
+                    }
+                }
+            } else null
+        )
+    }
 }
 
 // ═══════════════════════════════════════
@@ -606,7 +629,7 @@ fun ImportReviewDialog(
             ) {
                 items.forEachIndexed { index, item ->
                     val subtitle = when (item.conflictType) {
-                        ConflictType.EXACT -> "同名已存在：${item.similarName}（不可导入）"
+                        ConflictType.EXACT -> "同名已存在：${item.similarName}（勾选后覆盖原笔记）"
                         ConflictType.SIMILAR -> "高相似：${item.similarName}（可手动选择）"
                         ConflictType.NONE -> "无冲突"
                     }
@@ -620,7 +643,7 @@ fun ImportReviewDialog(
                         Checkbox(
                             checked = item.selected,
                             onCheckedChange = { onToggle(index, it) },
-                            enabled = item.conflictType != ConflictType.EXACT
+                            enabled = true
                         )
                         Column(modifier = Modifier.weight(1f)) {
                             Text(item.draft.name, color = Color.White, fontSize = 13.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
