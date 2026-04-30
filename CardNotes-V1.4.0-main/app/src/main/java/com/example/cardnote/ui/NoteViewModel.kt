@@ -46,6 +46,8 @@ data class NoteUiState(
     val noteToEdit: NoteEntity? = null,
     val noteToDelete: NoteEntity? = null,
     val importReviewItems: List<ImportReviewItem> = emptyList(),
+    val duplicateNameDialogMessage: String? = null,
+    val duplicateNameCanForceSave: Boolean = false,
     val snackbarMessage: String? = null
 )
 
@@ -61,10 +63,33 @@ data class NoteImportDraft(
     val url: String,
     val isDownloaded: Boolean,
     val remarks: String,
-    val categoryName: String?
+    val categoryName: String?,
+    val imagesBase64: List<String> = emptyList()
 )
 
 enum class ConflictType { NONE, EXACT, SIMILAR }
+
+private sealed class PendingSaveAction {
+    data class Add(
+        val name: String,
+        val url: String,
+        val isDownloaded: Boolean,
+        val remarks: String,
+        val imageUris: List<Uri>,
+        val categoryId: Long?
+    ) : PendingSaveAction()
+
+    data class Edit(
+        val note: NoteEntity,
+        val name: String,
+        val url: String,
+        val isDownloaded: Boolean,
+        val remarks: String,
+        val keptPaths: List<String>,
+        val newUris: List<Uri>,
+        val categoryId: Long?
+    ) : PendingSaveAction()
+}
 
 // private data class QueryKey(val catId: Long?, val filter: FilterState, val search: String)
 // 改为携带 id 列表
@@ -89,6 +114,7 @@ class NoteViewModel(application: Application) : AndroidViewModel(application) {
 
     private val _uiState = MutableStateFlow(NoteUiState())
     val uiState: StateFlow<NoteUiState> = _uiState.asStateFlow()
+    private var pendingSaveAction: PendingSaveAction? = null
 
     private fun normalizeName(value: String): String =
         value.lowercase().replace("\\s+".toRegex(), "")
@@ -313,16 +339,47 @@ class NoteViewModel(application: Application) : AndroidViewModel(application) {
     //         } finally { _uiState.update { it.copy(isLoading = false) } }
     //     }
     // }
-    fun addNote(name: String, url: String, isDownloaded: Boolean, remarks: String,
-                imageUris: List<Uri>, categoryId: Long?) {
+    fun addNote(
+        name: String,
+        url: String,
+        isDownloaded: Boolean,
+        remarks: String,
+        imageUris: List<Uri>,
+        categoryId: Long?
+    ) {
         viewModelScope.launch {
             _uiState.update { it.copy(isLoading = true) }
             try {
-                val (conflictType, matched) = findNameConflict(name)
-                if (conflictType != ConflictType.NONE) {
-                    val reason = if (conflictType == ConflictType.EXACT) "已存在同名笔记" else "存在高相似笔记"
-                    _uiState.update { it.copy(snackbarMessage = "$reason：$matched") }
-                    return@launch
+                val (conflictType, matched) = findNameConflict(name.trim())
+                when (conflictType) {
+                    ConflictType.EXACT -> {
+                        pendingSaveAction = null
+                        _uiState.update {
+                            it.copy(
+                                duplicateNameDialogMessage = "已存在同名笔记：$matched",
+                                duplicateNameCanForceSave = false
+                            )
+                        }
+                        return@launch
+                    }
+                    ConflictType.SIMILAR -> {
+                        pendingSaveAction = PendingSaveAction.Add(
+                            name = name,
+                            url = url,
+                            isDownloaded = isDownloaded,
+                            remarks = remarks,
+                            imageUris = imageUris,
+                            categoryId = categoryId
+                        )
+                        _uiState.update {
+                            it.copy(
+                                duplicateNameDialogMessage = "发现相似笔记：$matched\n仍要保存吗？",
+                                duplicateNameCanForceSave = true
+                            )
+                        }
+                        return@launch
+                    }
+                    ConflictType.NONE -> Unit
                 }
                 val paths = ImageStorageManager.copyAllToPrivateStorage(appCtx, imageUris)
                 noteRepo.insertNote(NoteEntity(name = name.trim(), url = url.trim(),
@@ -338,16 +395,51 @@ class NoteViewModel(application: Application) : AndroidViewModel(application) {
     fun showEditSheet(note: NoteEntity) { _uiState.update { it.copy(noteToEdit = note) } }
     fun hideEditSheet()                  { _uiState.update { it.copy(noteToEdit = null) } }
 
-    fun saveEdit(note: NoteEntity, name: String, url: String, isDownloaded: Boolean,
-                 remarks: String, keptPaths: List<String>, newUris: List<Uri>, categoryId: Long?) {
+    fun saveEdit(
+        note: NoteEntity,
+        name: String,
+        url: String,
+        isDownloaded: Boolean,
+        remarks: String,
+        keptPaths: List<String>,
+        newUris: List<Uri>,
+        categoryId: Long?
+    ) {
         viewModelScope.launch {
             _uiState.update { it.copy(isLoading = true) }
             try {
                 val (conflictType, matched) = findNameConflict(name, excludeNoteId = note.id)
-                if (conflictType != ConflictType.NONE) {
-                    val reason = if (conflictType == ConflictType.EXACT) "已存在同名笔记" else "存在高相似笔记"
-                    _uiState.update { it.copy(snackbarMessage = "$reason：$matched") }
-                    return@launch
+                when (conflictType) {
+                    ConflictType.EXACT -> {
+                        pendingSaveAction = null
+                        _uiState.update {
+                            it.copy(
+                                duplicateNameDialogMessage = "已存在同名笔记：$matched",
+                                duplicateNameCanForceSave = false
+                            )
+                        }
+                        return@launch
+                    }
+                    ConflictType.SIMILAR -> {
+                        pendingSaveAction = PendingSaveAction.Edit(
+                            note = note,
+                            name = name,
+                            url = url,
+                            isDownloaded = isDownloaded,
+                            remarks = remarks,
+                            keptPaths = keptPaths,
+                            newUris = newUris,
+                            categoryId = categoryId
+                        )
+                        _uiState.update {
+                            it.copy(
+                                duplicateNameDialogMessage = "发现相似笔记：$matched\n仍要保存吗？",
+                                duplicateNameCanForceSave = true
+                            )
+                        }
+                        return@launch
+                    }
+                    ConflictType.NONE -> Unit
                 }
                 val removed = note.images - keptPaths.toSet()
                 ImageStorageManager.deleteImages(removed)
@@ -359,6 +451,52 @@ class NoteViewModel(application: Application) : AndroidViewModel(application) {
             } catch (e: Exception) {
                 _uiState.update { it.copy(snackbarMessage = "保存失败：${e.message}") }
             } finally { _uiState.update { it.copy(isLoading = false) } }
+        }
+    }
+
+    fun confirmForceSaveDuplicateName() {
+        val action = pendingSaveAction ?: return
+        clearDuplicateNameDialog()
+        viewModelScope.launch {
+            _uiState.update { it.copy(isLoading = true) }
+            try {
+                when (action) {
+                    is PendingSaveAction.Add -> {
+                        val paths = ImageStorageManager.copyAllToPrivateStorage(appCtx, action.imageUris)
+                        noteRepo.insertNote(
+                            NoteEntity(
+                                name = action.name.trim(),
+                                url = action.url.trim(),
+                                isDownloaded = action.isDownloaded,
+                                remarks = action.remarks.trim(),
+                                images = paths,
+                                categoryId = action.categoryId
+                            )
+                        )
+                        _uiState.update { it.copy(showAddSheet = false) }
+                    }
+                    is PendingSaveAction.Edit -> {
+                        val removed = action.note.images - action.keptPaths.toSet()
+                        ImageStorageManager.deleteImages(removed)
+                        val newPaths = ImageStorageManager.copyAllToPrivateStorage(appCtx, action.newUris)
+                        noteRepo.updateNote(
+                            action.note.copy(
+                                name = action.name.trim(),
+                                url = action.url.trim(),
+                                isDownloaded = action.isDownloaded,
+                                remarks = action.remarks.trim(),
+                                images = (action.keptPaths + newPaths).take(9),
+                                categoryId = action.categoryId
+                            )
+                        )
+                        _uiState.update { it.copy(noteToEdit = null) }
+                    }
+                }
+            } catch (e: Exception) {
+                _uiState.update { it.copy(snackbarMessage = "保存失败：${e.message}") }
+            } finally {
+                _uiState.update { it.copy(isLoading = false) }
+            }
         }
     }
 
@@ -401,6 +539,11 @@ class NoteViewModel(application: Application) : AndroidViewModel(application) {
 
                 val notesArray = JSONArray()
                 allNotes.forEach { note ->
+                    val encodedImages = buildList {
+                        for (path in note.images) {
+                            ImageStorageManager.readImageAsBase64(path)?.let { add(it) }
+                        }
+                    }
                     notesArray.put(
                         JSONObject().apply {
                             put("name", note.name)
@@ -408,6 +551,7 @@ class NoteViewModel(application: Application) : AndroidViewModel(application) {
                             put("isDownloaded", note.isDownloaded)
                             put("remarks", note.remarks)
                             put("categoryName", note.categoryId?.let { categoryNameById[it] })
+                            put("imagesBase64", JSONArray(encodedImages))
                         }
                     )
                 }
@@ -443,7 +587,14 @@ class NoteViewModel(application: Application) : AndroidViewModel(application) {
                         url = obj.optString("url", "").trim(),
                         isDownloaded = obj.optBoolean("isDownloaded", false),
                         remarks = obj.optString("remarks", "").trim(),
-                        categoryName = obj.optString("categoryName", "").trim().ifBlank { null }
+                        categoryName = obj.optString("categoryName", "").trim().ifBlank { null },
+                        imagesBase64 = buildList {
+                            val arr = obj.optJSONArray("imagesBase64") ?: JSONArray()
+                            for (j in 0 until arr.length()) {
+                                val encoded = arr.optString(j).trim()
+                                if (encoded.isNotEmpty()) add(encoded)
+                            }
+                        }
                     )
                     if (draft.name.isBlank()) continue
                     val target = normalizeName(draft.name)
@@ -494,7 +645,7 @@ class NoteViewModel(application: Application) : AndroidViewModel(application) {
         _uiState.update { state ->
             state.copy(
                 importReviewItems = state.importReviewItems.mapIndexed { i, item ->
-                    if (i == index && item.conflictType != ConflictType.EXACT) item.copy(selected = selected) else item
+                    if (i == index) item.copy(selected = selected) else item
                 }
             )
         }
@@ -527,19 +678,46 @@ class NoteViewModel(application: Application) : AndroidViewModel(application) {
                     val key = name.trim()
                     categoryMap[key] ?: catRepo.insert(CategoryEntity(name = key)).also { categoryMap[key] = it }
                 }
-                noteRepo.insertNote(
-                    NoteEntity(
-                        name = item.draft.name,
-                        url = item.draft.url,
-                        isDownloaded = item.draft.isDownloaded,
-                        remarks = item.draft.remarks,
-                        categoryId = categoryId
-                    )
+                val importedImagePaths = ImageStorageManager.writeBase64ImagesToPrivateStorage(
+                    context = appCtx,
+                    base64List = item.draft.imagesBase64
                 )
+                val existing = noteRepo.getAllNotesSnapshot().firstOrNull {
+                    normalizeName(it.name) == normalizeName(item.draft.name)
+                }
+                if (existing != null && item.conflictType == ConflictType.EXACT) {
+                    ImageStorageManager.deleteImages(existing.images)
+                    noteRepo.updateNote(
+                        existing.copy(
+                            name = item.draft.name,
+                            url = item.draft.url,
+                            isDownloaded = item.draft.isDownloaded,
+                            remarks = item.draft.remarks,
+                            images = importedImagePaths,
+                            categoryId = categoryId
+                        )
+                    )
+                } else {
+                    noteRepo.insertNote(
+                        NoteEntity(
+                            name = item.draft.name,
+                            url = item.draft.url,
+                            isDownloaded = item.draft.isDownloaded,
+                            remarks = item.draft.remarks,
+                            images = importedImagePaths,
+                            categoryId = categoryId
+                        )
+                    )
+                }
                 count++
             }
             _uiState.update { it.copy(importReviewItems = emptyList(), snackbarMessage = "已导入 $count 条笔记") }
         }
+    }
+
+    fun clearDuplicateNameDialog() {
+        pendingSaveAction = null
+        _uiState.update { it.copy(duplicateNameDialogMessage = null, duplicateNameCanForceSave = false) }
     }
 
     fun clearSnackbar() { _uiState.update { it.copy(snackbarMessage = null) } }
