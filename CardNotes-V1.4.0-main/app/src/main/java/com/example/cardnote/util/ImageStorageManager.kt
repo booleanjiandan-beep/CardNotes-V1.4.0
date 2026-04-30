@@ -2,6 +2,7 @@ package com.example.cardnote.util
 
 import android.content.Context
 import android.net.Uri
+import android.util.Base64
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
@@ -84,4 +85,33 @@ object ImageStorageManager {
                 }
             }
         }
+
+    /**
+     * 读取本地图片并编码为 Base64（用于导出）
+     */
+    suspend fun readImageAsBase64(path: String): String? = withContext(Dispatchers.IO) {
+        runCatching {
+            val file = File(path)
+            if (!file.exists() || !file.isFile) return@withContext null
+            Base64.encodeToString(file.readBytes(), Base64.NO_WRAP)
+        }.getOrNull()
+    }
+
+    /**
+     * 将 Base64 图片写入应用私有目录（用于导入）
+     */
+    suspend fun writeBase64ImagesToPrivateStorage(
+        context: Context,
+        base64List: List<String>
+    ): List<String> = withContext(Dispatchers.IO) {
+        val dir = getImageDir(context)
+        base64List.mapNotNull { encoded ->
+            runCatching {
+                val bytes = Base64.decode(encoded, Base64.DEFAULT)
+                val file = File(dir, "${UUID.randomUUID()}.jpg")
+                file.outputStream().use { it.write(bytes) }
+                file.absolutePath
+            }.getOrNull()
+        }
+    }
 }
