@@ -93,7 +93,7 @@ fun CardNoteApp(vm: NoteViewModel = viewModel()) {
 
     val pager = rememberPagerState(initialPage = 0, pageCount = { notes.size.coerceAtLeast(1) })
     val exportLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.CreateDocument("application/json")
+        contract = ActivityResultContracts.CreateDocument("application/zip")
     ) { uri -> uri?.let(vm::exportNotes) }
     val importLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocument()
@@ -169,8 +169,8 @@ fun CardNoteApp(vm: NoteViewModel = viewModel()) {
                     onToggleSearch         = { vm.toggleSearch() },
                     onSearchQueryChange    = { vm.onSearchQueryChange(it) },
                     onClearSearch          = { vm.clearSearch() },
-                    onExportNotes          = { exportLauncher.launch("cardnotes_export.json") },
-                    onImportNotes          = { importLauncher.launch(arrayOf("application/json", "text/plain")) }
+                    onExportNotes          = { exportLauncher.launch("cardnotes_export.zip") },
+                    onImportNotes          = { importLauncher.launch(arrayOf("application/zip", "application/octet-stream")) }
                 )
                 Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                     if (notes.isEmpty()) EmptyStateView(filterState, uiState.searchQuery)
