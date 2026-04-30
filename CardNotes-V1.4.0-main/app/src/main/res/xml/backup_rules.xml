@@ -4,10 +4,6 @@
    For Android 12+ see data_extraction_rules.xml.
 -->
 <full-backup-content>
-    <!-- Exclude database files from Auto Backup -->
-    <exclude domain="database" path="note_database" />
-    <exclude domain="database" path="note_database-shm" />
-    <exclude domain="database" path="note_database-wal" />
-    <!-- Include private images in device-to-device transfer -->
+    <!-- Only back up private images directory. -->
     <include domain="file" path="note_images" />
 </full-backup-content>
