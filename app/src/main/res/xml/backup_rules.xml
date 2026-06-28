@@ -1,9 +1,0 @@
-<?xml version="1.0" encoding="utf-8"?>
-<!--
-   Backup rules for Android 11 and below (Auto Backup).
-   For Android 12+ see data_extraction_rules.xml.
--->
-<full-backup-content>
-    <!-- Only back up private images directory. -->
-    <include domain="file" path="note_images" />
-</full-backup-content>
