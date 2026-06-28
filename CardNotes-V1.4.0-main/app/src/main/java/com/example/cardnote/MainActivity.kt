@@ -92,6 +92,7 @@ fun CardNoteApp(vm: NoteViewModel = viewModel()) {
     }
 
     val pager = rememberPagerState(initialPage = 0, pageCount = { notes.size.coerceAtLeast(1) })
+    val scrollToNoteId by vm.scrollToNoteId.collectAsStateWithLifecycle()
     val exportLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.CreateDocument("application/zip")
     ) { uri -> uri?.let(vm::exportNotes) }
@@ -101,6 +102,15 @@ fun CardNoteApp(vm: NoteViewModel = viewModel()) {
 
     LaunchedEffect(notes.size) { if (pager.currentPage >= notes.size && notes.isNotEmpty()) pager.animateScrollToPage(0) }
     LaunchedEffect(pager.currentPage) { vm.onPagerPageChanged(pager.currentPage) }
+    LaunchedEffect(scrollToNoteId, notes) {
+        scrollToNoteId?.let { noteId ->
+            val index = notes.indexOfFirst { it.id == noteId }
+            if (index >= 0) {
+                pager.animateScrollToPage(index)
+                vm.consumeScrollToNoteId()
+            }
+        }
+    }
 
     // 抽屉关闭时 back 键
     BackHandler(uiState.isCategoryDrawerOpen) { vm.closeCategoryDrawer() }
@@ -148,10 +158,13 @@ fun CardNoteApp(vm: NoteViewModel = viewModel()) {
                 CategoryDrawer(
                     tree = uiState.categoryTree,
                     selectedId = uiState.selectedCategoryId,
+                    hiddenCategoryIds = uiState.hiddenCategoryIds,
                     onSelect   = { id -> vm.selectCategory(id); vm.closeCategoryDrawer() },
                     onAddRoot  = { name, color -> vm.addCategory(name, null, color) },
                     onAddChild = { name, pid, color -> vm.addCategory(name, pid, color) },
                     onRename   = { cat, name, color -> vm.renameCategory(cat, name, color) },
+                    onMove     = { cat, parentId -> vm.moveCategory(cat, parentId) },
+                    onToggleHide = vm::toggleHideCategory,
                     onDelete   = { cat -> vm.deleteCategory(cat) },
                     onClose    = { vm.closeCategoryDrawer() }
                 )
@@ -163,6 +176,7 @@ fun CardNoteApp(vm: NoteViewModel = viewModel()) {
                     searchQuery = uiState.searchQuery, isSearchActive = uiState.isSearchActive,
                     selectedCatName = selectedCatName,
                     selectedCatColor = selectedCatColor,
+                    hiddenCategoryCount = uiState.hiddenCategoryIds.size,
                     onOpenDrawer           = { vm.toggleCategoryDrawer() },
                     onToggleDownloaded     = { vm.toggleDownloadedFilter() },
                     onToggleNotDownloaded  = { vm.toggleNotDownloadedFilter() },
@@ -230,19 +244,47 @@ fun CardNoteApp(vm: NoteViewModel = viewModel()) {
             title = { Text("保存失败", color = Color.White, fontWeight = FontWeight.Bold) },
             text = { Text(msg, color = Color(0xFFCCCCDD)) },
             confirmButton = {
-                Button(
-                    onClick = if (uiState.duplicateNameCanForceSave) vm::confirmForceSaveDuplicateName else vm::clearDuplicateNameDialog,
-                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF6C63FF)),
-                    shape = RoundedCornerShape(10.dp)
-                ) { Text(if (uiState.duplicateNameCanForceSave) "仍然保存" else "知道了") }
-            },
-            dismissButton = if (uiState.duplicateNameCanForceSave) {
-                {
-                    TextButton(onClick = vm::clearDuplicateNameDialog) {
-                        Text("取消", color = Color(0xFF8888AA))
+                when {
+                    uiState.duplicateConflictNoteId != null && !uiState.duplicateNameCanForceSave -> {
+                        Button(
+                            onClick = vm::navigateToDuplicateNote,
+                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF6C63FF)),
+                            shape = RoundedCornerShape(10.dp)
+                        ) { Text("跳转查看") }
+                    }
+                    uiState.duplicateNameCanForceSave -> {
+                        Button(
+                            onClick = vm::confirmForceSaveDuplicateName,
+                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF6C63FF)),
+                            shape = RoundedCornerShape(10.dp)
+                        ) { Text("仍然保存") }
+                    }
+                    else -> {
+                        Button(
+                            onClick = vm::clearDuplicateNameDialog,
+                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF6C63FF)),
+                            shape = RoundedCornerShape(10.dp)
+                        ) { Text("知道了") }
                     }
                 }
-            } else null
+            },
+            dismissButton = when {
+                uiState.duplicateConflictNoteId != null && !uiState.duplicateNameCanForceSave -> {
+                    {
+                        TextButton(onClick = vm::clearDuplicateNameDialog) {
+                            Text("取消", color = Color(0xFF8888AA))
+                        }
+                    }
+                }
+                uiState.duplicateNameCanForceSave -> {
+                    {
+                        TextButton(onClick = vm::clearDuplicateNameDialog) {
+                            Text("取消", color = Color(0xFF8888AA))
+                        }
+                    }
+                }
+                else -> null
+            }
         )
     }
 }
@@ -253,10 +295,13 @@ fun CardNoteApp(vm: NoteViewModel = viewModel()) {
 @Composable
 fun CategoryDrawer(
     tree: List<CategoryNode>, selectedId: Long?,
+    hiddenCategoryIds: Set<Long> = emptySet(),
     onSelect: (Long?) -> Unit,
     onAddRoot: (name: String, color: String) -> Unit,
     onAddChild: (name: String, parentId: Long, color: String) -> Unit,
     onRename: (cat: CategoryEntity, newName: String, newColor: String) -> Unit,
+    onMove: (cat: CategoryEntity, newParentId: Long?) -> Unit,
+    onToggleHide: (Long) -> Unit,
     onDelete: (CategoryEntity) -> Unit,
     onClose: () -> Unit
 ) {
@@ -285,7 +330,9 @@ fun CategoryDrawer(
                     onAddChild = {}, onRename = {}, onDelete = {})
                 Divider(color = Color(0xFF1E1E2E), modifier = Modifier.padding(vertical = 4.dp))
                 tree.forEach { node ->
-                    CategoryNodeItem(node, selectedId, onSelect, onAddChild, onRename, onDelete)
+                    CategoryNodeItem(
+                        node, tree, selectedId, hiddenCategoryIds, onSelect, onAddChild, onRename, onMove, onToggleHide, onDelete
+                    )
                 }
             }
         }
@@ -300,17 +347,24 @@ fun CategoryDrawer(
 
 @Composable
 fun CategoryNodeItem(
-    node: CategoryNode, selectedId: Long?,
+    node: CategoryNode,
+    tree: List<CategoryNode>,
+    selectedId: Long?,
+    hiddenCategoryIds: Set<Long>,
     onSelect: (Long?) -> Unit,
     onAddChild: (name: String, parentId: Long, color: String) -> Unit,
     onRename: (cat: CategoryEntity, newName: String, newColor: String) -> Unit,
+    onMove: (cat: CategoryEntity, newParentId: Long?) -> Unit,
+    onToggleHide: (Long) -> Unit,
     onDelete: (CategoryEntity) -> Unit
 ) {
     var showAddChild by remember { mutableStateOf(false) }
     var showRename   by remember { mutableStateOf(false) }
+    var showMove     by remember { mutableStateOf(false) }
     var expanded     by remember { mutableStateOf(true) }
     val canAddChild  = node.depth < 3
     val accentColor  = parseColor(node.entity.colorHex)
+    val isHidden     = node.entity.id in hiddenCategoryIds
 
     CategoryItem(
         label = node.entity.name,
@@ -318,18 +372,23 @@ fun CategoryNodeItem(
         accentColor = accentColor,
         selected = selectedId == node.entity.id, depth = node.depth,
         isFolder = node.children.isNotEmpty(),
+        isHidden = isHidden,
         expanded = expanded, onToggleExpand = { expanded = !expanded },
         onSelect = { onSelect(node.entity.id) },
         canAddChild = canAddChild,
         onAddChild = { showAddChild = true },
         onRename   = { showRename = true },
+        onMove     = { showMove = true },
+        onToggleHide = { onToggleHide(node.entity.id) },
         onDelete   = { onDelete(node.entity) }
     )
 
     AnimatedVisibility(visible = expanded) {
         Column {
             node.children.forEach { child ->
-                CategoryNodeItem(child, selectedId, onSelect, onAddChild, onRename, onDelete)
+                CategoryNodeItem(
+                    child, tree, selectedId, hiddenCategoryIds, onSelect, onAddChild, onRename, onMove, onToggleHide, onDelete
+                )
             }
         }
     }
@@ -345,6 +404,24 @@ fun CategoryNodeItem(
             onConfirm = { name, color -> onRename(node.entity, name, color); showRename = false },
             onDismiss = { showRename = false })
     }
+    if (showMove) {
+        CategoryMoveTargetDialog(
+            tree = tree,
+            excludedIds = collectMoveExcludedIds(node),
+            onSelect = { parentId -> onMove(node.entity, parentId); showMove = false },
+            onDismiss = { showMove = false }
+        )
+    }
+}
+
+private fun collectMoveExcludedIds(node: CategoryNode): Set<Long> {
+    val result = mutableSetOf<Long>()
+    fun walk(current: CategoryNode) {
+        result.add(current.entity.id)
+        current.children.forEach { walk(it) }
+    }
+    walk(node)
+    return result
 }
 
 @Composable
@@ -352,9 +429,11 @@ fun CategoryItem(
     label: String, icon: androidx.compose.ui.graphics.vector.ImageVector,
     accentColor: Color = Color(0xFF6C63FF),
     selected: Boolean, depth: Int, isFolder: Boolean,
+    isHidden: Boolean = false,
     expanded: Boolean = false, onToggleExpand: () -> Unit = {},
     onSelect: () -> Unit, canAddChild: Boolean,
-    onAddChild: () -> Unit, onRename: () -> Unit, onDelete: () -> Unit
+    onAddChild: () -> Unit, onRename: () -> Unit, onMove: () -> Unit = {},
+    onToggleHide: () -> Unit = {}, onDelete: () -> Unit
 ) {
     var showMenu by remember { mutableStateOf(false) }
     val indentDp = (depth * 20).dp
@@ -379,9 +458,17 @@ fun CategoryItem(
         // 彩色圆点标记
         Box(modifier = Modifier.size(8.dp).clip(CircleShape).background(accentColor))
         Icon(icon, null, tint = if (selected) accentColor else Color(0xFF8888AA), modifier = Modifier.size(16.dp))
-        Text(label, fontSize = 14.sp, color = if (selected) Color.White else Color(0xFFCCCCDD),
+        Text(label, fontSize = 14.sp,
+            color = when {
+                isHidden -> Color(0xFF666688)
+                selected -> Color.White
+                else -> Color(0xFFCCCCDD)
+            },
             fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal,
             modifier = Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis)
+        if (isHidden) {
+            Icon(Icons.Default.VisibilityOff, "已隐藏", tint = Color(0xFF666688), modifier = Modifier.size(14.dp))
+        }
 
         if (onRename != {}) {
             Box {
@@ -398,6 +485,21 @@ fun CategoryItem(
                         text = { Text("重命名", color = Color.White, fontSize = 13.sp) },
                         leadingIcon = { Icon(Icons.Default.DriveFileRenameOutline, null, tint = Color(0xFF8888AA), modifier = Modifier.size(16.dp)) },
                         onClick = { showMenu = false; onRename() })
+                    DropdownMenuItem(
+                        text = { Text("移动到", color = Color.White, fontSize = 13.sp) },
+                        leadingIcon = { Icon(Icons.Default.DriveFileMove, null, tint = Color(0xFF8888AA), modifier = Modifier.size(16.dp)) },
+                        onClick = { showMenu = false; onMove() })
+                    DropdownMenuItem(
+                        text = { Text(if (isHidden) "显示笔记" else "隐藏笔记", color = Color.White, fontSize = 13.sp) },
+                        leadingIcon = {
+                            Icon(
+                                if (isHidden) Icons.Default.Visibility else Icons.Default.VisibilityOff,
+                                null,
+                                tint = Color(0xFF8888AA),
+                                modifier = Modifier.size(16.dp)
+                            )
+                        },
+                        onClick = { showMenu = false; onToggleHide() })
                     DropdownMenuItem(
                         text = { Text("删除", color = Color(0xFFFF5555), fontSize = 13.sp) },
                         leadingIcon = { Icon(Icons.Default.Delete, null, tint = Color(0xFFFF5555), modifier = Modifier.size(16.dp)) },
@@ -476,6 +578,7 @@ fun FilterHeader(
     filterState: FilterState, totalCount: Int, searchQuery: String, isSearchActive: Boolean,
     selectedCatName: String?,
     selectedCatColor: Color = Color(0xFF6C63FF),
+    hiddenCategoryCount: Int = 0,
     onOpenDrawer: () -> Unit,
     onToggleDownloaded: () -> Unit, onToggleNotDownloaded: () -> Unit,
     onToggleSearch: () -> Unit, onSearchQueryChange: (String) -> Unit, onClearSearch: () -> Unit,
@@ -584,7 +687,7 @@ fun FilterHeader(
             }
 
             // 状态指示条
-            val showBanner = searchQuery.isNotEmpty() || !filterState.showAll || selectedCatName != null
+            val showBanner = searchQuery.isNotEmpty() || !filterState.showAll || selectedCatName != null || hiddenCategoryCount > 0
             AnimatedVisibility(visible = showBanner) {
                 Row(modifier = Modifier.fillMaxWidth().background(selectedCatColor.copy(0.07f)).padding(horizontal = 16.dp, vertical = 6.dp),
                     verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
@@ -592,6 +695,12 @@ fun FilterHeader(
                         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
                             Box(modifier = Modifier.size(7.dp).clip(CircleShape).background(selectedCatColor))
                             Text(it, fontSize = 11.sp, color = selectedCatColor, fontWeight = FontWeight.Medium)
+                        }
+                    }
+                    if (hiddenCategoryCount > 0) {
+                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(3.dp)) {
+                            Icon(Icons.Default.VisibilityOff, null, tint = Color(0xFF8888CC), modifier = Modifier.size(12.dp))
+                            Text("已隐藏 $hiddenCategoryCount 个分类", fontSize = 11.sp, color = Color(0xFF8888CC))
                         }
                     }
                     if (searchQuery.isNotEmpty()) Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(3.dp)) {
@@ -876,7 +985,19 @@ fun NoteCard(
                         Text(it, fontSize = 11.sp, color = catColor)
                     }
                 }
-                HighlightText(note.name, searchQuery, Color.White, 20.sp, 2, FontWeight.Bold)
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Box(modifier = Modifier.weight(1f)) {
+                        HighlightText(note.name, searchQuery, Color.White, 20.sp, 2, FontWeight.Bold)
+                    }
+                    if (note.name.isNotBlank()) {
+                        IconButton(onClick = {
+                            val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                            cm.setPrimaryClip(ClipData.newPlainText("name", note.name))
+                        }, modifier = Modifier.size(28.dp).clip(RoundedCornerShape(6.dp)).background(Color(0xFF6C63FF).copy(0.15f))) {
+                            Icon(Icons.Default.ContentCopy, "复制名称", tint = Color(0xFF6C63FF), modifier = Modifier.size(14.dp))
+                        }
+                    }
+                }
                 Spacer(modifier = Modifier.height(8.dp))
                 // URL + 复制
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
@@ -1248,6 +1369,69 @@ fun NoteBottomSheet(
         CategoryPickerDialog(tree = categoryTree, selectedId = selectedCat,
             onSelect = { selectedCat = it; showCatPicker = false }, onDismiss = { showCatPicker = false })
     }
+}
+
+// ═══════════════════════════════════════
+// 分类移动目标选择
+// ═══════════════════════════════════════
+@Composable
+fun CategoryMoveTargetDialog(
+    tree: List<CategoryNode>,
+    excludedIds: Set<Long>,
+    onSelect: (Long?) -> Unit,
+    onDismiss: () -> Unit
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = Color(0xFF1E1E2E),
+        shape = RoundedCornerShape(16.dp),
+        title = { Text("移动到", color = Color.White, fontWeight = FontWeight.Bold) },
+        text = {
+            Column(
+                modifier = Modifier.verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(2.dp)
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(8.dp))
+                        .clickable { onSelect(null) }.padding(12.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Icon(Icons.Default.FolderOpen, null, tint = Color(0xFF8888AA), modifier = Modifier.size(16.dp))
+                    Text("顶级分类", color = Color(0xFFBBBBCC), fontSize = 14.sp)
+                }
+                Divider(color = Color(0xFF2A2A38), modifier = Modifier.padding(vertical = 4.dp))
+                @Composable
+                fun renderNodes(nodes: List<CategoryNode>) {
+                    nodes.forEach { node ->
+                        if (node.entity.id !in excludedIds) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(8.dp))
+                                    .clickable { onSelect(node.entity.id) }
+                                    .padding(start = (12 + node.depth * 18).dp, end = 12.dp, top = 10.dp, bottom = 10.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                Icon(
+                                    if (node.children.isEmpty()) Icons.Default.Label else Icons.Default.Folder,
+                                    null,
+                                    tint = Color(0xFF8888AA),
+                                    modifier = Modifier.size(15.dp)
+                                )
+                                Text(node.entity.name, color = Color(0xFFBBBBCC), fontSize = 14.sp)
+                            }
+                        }
+                        renderNodes(node.children)
+                    }
+                }
+                renderNodes(tree)
+            }
+        },
+        confirmButton = {},
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("取消", color = Color(0xFF8888AA)) }
+        }
+    )
 }
 
 // ═══════════════════════════════════════

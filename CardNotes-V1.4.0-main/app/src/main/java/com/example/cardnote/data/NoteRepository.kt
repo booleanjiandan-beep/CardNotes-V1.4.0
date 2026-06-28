@@ -79,10 +79,12 @@ class NoteRepository(private val dao: NoteDao) {
     suspend fun deleteNote(note: NoteEntity)  = dao.deleteNote(note)
     suspend fun updateDownloadStatus(id: Long, dl: Boolean) = dao.updateDownloadStatus(id, dl)
     suspend fun getAllNotesSnapshot() = dao.getAllNotesSnapshot()
+    suspend fun getNoteById(id: Long) = dao.getNoteById(id)
 }
 
 class CategoryRepository(private val dao: CategoryDao) {
-    fun getAllCategories()    = dao.getAllCategories()
+    fun getAllCategories() = dao.getAllCategories()
+    suspend fun getAllCategoriesSnapshot() = dao.getAllCategoriesSnapshot()
     fun getRootCategories()  = dao.getRootCategories()
     fun getChildren(pid: Long) = dao.getChildren(pid)
     suspend fun getDepth(id: Long): Int {
@@ -98,4 +100,52 @@ class CategoryRepository(private val dao: CategoryDao) {
     suspend fun insert(cat: CategoryEntity) = dao.insertCategory(cat)
     suspend fun update(cat: CategoryEntity) = dao.updateCategory(cat)
     suspend fun delete(cat: CategoryEntity) = dao.deleteCategory(cat)
+
+    suspend fun moveCategory(category: CategoryEntity, newParentId: Long?): String? {
+        val all = dao.getAllCategoriesSnapshot()
+        val validationError = validateMove(category.id, newParentId, all)
+        if (validationError != null) return validationError
+        dao.updateCategory(category.copy(parentId = newParentId))
+        return null
+    }
+
+    private fun validateMove(categoryId: Long, newParentId: Long?, all: List<CategoryEntity>): String? {
+        if (newParentId == categoryId) return "不能移动到自身"
+        if (newParentId != null) {
+            if (all.none { it.id == newParentId }) return "目标分类不存在"
+            if (isDescendant(categoryId, newParentId, all)) return "不能移动到子分类下"
+        }
+        val newBaseDepth = treeDepth(newParentId, all) + 1
+        val maxRelativeDepth = subtreeMaxRelativeDepth(categoryId, all)
+        if (newBaseDepth + maxRelativeDepth > 3) return "移动后分类层级将超过四级"
+        return null
+    }
+
+    private fun treeDepth(categoryId: Long?, all: List<CategoryEntity>): Int {
+        if (categoryId == null) return -1
+        var depth = 0
+        var currentId: Long? = categoryId
+        while (currentId != null) {
+            val entity = all.firstOrNull { it.id == currentId } ?: break
+            if (entity.parentId == null) return depth
+            depth++
+            currentId = entity.parentId
+        }
+        return depth
+    }
+
+    private fun subtreeMaxRelativeDepth(categoryId: Long, all: List<CategoryEntity>): Int {
+        val children = all.filter { it.parentId == categoryId }
+        if (children.isEmpty()) return 0
+        return 1 + children.maxOf { subtreeMaxRelativeDepth(it.id, all) }
+    }
+
+    private fun isDescendant(ancestorId: Long, candidateId: Long, all: List<CategoryEntity>): Boolean {
+        var currentId: Long? = candidateId
+        while (currentId != null) {
+            if (currentId == ancestorId) return true
+            currentId = all.firstOrNull { it.id == currentId }?.parentId
+        }
+        return false
+    }
 }

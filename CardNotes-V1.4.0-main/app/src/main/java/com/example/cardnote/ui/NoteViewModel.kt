@@ -48,14 +48,22 @@ data class NoteUiState(
     val categoryTree: List<CategoryNode> = emptyList(),
     val selectedCategoryId: Long? = null,   // null = 全部
     val isCategoryDrawerOpen: Boolean = false,
+    val hiddenCategoryIds: Set<Long> = emptySet(),
     // sheets & dialogs
     val showAddSheet: Boolean = false,
     val noteToEdit: NoteEntity? = null,
     val noteToDelete: NoteEntity? = null,
     val importReviewItems: List<ImportReviewItem> = emptyList(),
+    val pendingImportCategories: List<CategoryExportItem> = emptyList(),
     val duplicateNameDialogMessage: String? = null,
     val duplicateNameCanForceSave: Boolean = false,
+    val duplicateConflictNoteId: Long? = null,
     val snackbarMessage: String? = null
+)
+
+data class CategoryExportItem(
+    val path: String,
+    val colorHex: String = "#6C63FF"
 )
 
 data class ImportReviewItem(
@@ -70,11 +78,17 @@ data class NoteImportDraft(
     val url: String,
     val isDownloaded: Boolean,
     val remarks: String,
-    val categoryName: String?,
+    val categoryPath: String?,
     val imageBytesList: List<ByteArray> = emptyList()
 )
 
 enum class ConflictType { NONE, EXACT, SIMILAR }
+
+private data class NameConflict(
+    val type: ConflictType,
+    val matchedName: String? = null,
+    val matchedNoteId: Long? = null
+)
 
 private sealed class PendingSaveAction {
     data class Add(
@@ -123,6 +137,8 @@ class NoteViewModel(application: Application) : AndroidViewModel(application) {
 
     private val _uiState = MutableStateFlow(NoteUiState())
     val uiState: StateFlow<NoteUiState> = _uiState.asStateFlow()
+    private val _scrollToNoteId = MutableStateFlow<Long?>(null)
+    val scrollToNoteId: StateFlow<Long?> = _scrollToNoteId.asStateFlow()
     private var pendingSaveAction: PendingSaveAction? = null
 
     private fun normalizeName(value: String): String =
@@ -155,25 +171,30 @@ class NoteViewModel(application: Application) : AndroidViewModel(application) {
     private suspend fun findNameConflict(
         name: String,
         excludeNoteId: Long? = null
-    ): Pair<ConflictType, String?> {
+    ): NameConflict {
         val target = normalizeName(name.trim())
-        if (target.isBlank()) return ConflictType.NONE to null
+        if (target.isBlank()) return NameConflict(ConflictType.NONE)
         val notes = noteRepo.getAllNotesSnapshot()
         val candidates = if (excludeNoteId == null) notes else notes.filterNot { it.id == excludeNoteId }
         candidates.firstOrNull { normalizeName(it.name) == target }?.let {
-            return ConflictType.EXACT to it.name
+            return NameConflict(ConflictType.EXACT, it.name, it.id)
         }
         var bestName: String? = null
+        var bestNoteId: Long? = null
         var bestScore = 0.0
         candidates.forEach { note ->
             val score = levenshteinSimilarity(target, normalizeName(note.name))
             if (score > bestScore) {
                 bestScore = score
                 bestName = note.name
+                bestNoteId = note.id
             }
         }
-        return if (bestScore >= SIMILARITY_THRESHOLD) ConflictType.SIMILAR to bestName
-        else ConflictType.NONE to null
+        return if (bestScore >= SIMILARITY_THRESHOLD) {
+            NameConflict(ConflictType.SIMILAR, bestName, bestNoteId)
+        } else {
+            NameConflict(ConflictType.NONE)
+        }
     }
 
     init {
@@ -188,20 +209,26 @@ class NoteViewModel(application: Application) : AndroidViewModel(application) {
             }
         }
 
-        // 监听笔记（catId + filter + search 三路合并）
+        // 监听笔记（catId + filter + search + hidden 合并）
         viewModelScope.launch {
             combine(
                 _uiState.map { it.selectedCategoryId }.distinctUntilChanged(),
+                _uiState.map { it.categoryTree }.distinctUntilChanged(),
                 _filterState,
-                _searchQuery
-            ) { catId, filter, search ->
-                // 直接读 StateFlow 当前值，无需加入 combine
-                val tree = _uiState.value.categoryTree
+                _searchQuery,
+                _uiState.map { it.hiddenCategoryIds }.distinctUntilChanged()
+            ) { catId, tree, filter, search, hidden ->
                 val ids = if (catId == null) null else collectIds(tree, catId)
-                QueryKey(ids, filter, search)
+                QueryKey(ids, filter, search) to expandHiddenCategoryIds(hidden, tree)
             }
-                .flatMapLatest { key ->
+                .flatMapLatest { (key, excludedIds) ->
                     noteRepo.queryNotes(key.categoryIds, key.filter, key.search)
+                        .map { notes ->
+                            notes.filter { note ->
+                                val categoryId = note.categoryId ?: return@filter true
+                                categoryId !in excludedIds
+                            }
+                        }
                 }
                 .collect { notes ->
                     _uiState.update { state ->
@@ -251,7 +278,6 @@ class NoteViewModel(application: Application) : AndroidViewModel(application) {
     private fun collectIds(nodes: List<CategoryNode>, targetId: Long): List<Long>? {
         for (node in nodes) {
             if (node.entity.id == targetId) {
-                // 找到目标节点，收集自身 + 所有后代
                 val result = mutableListOf<Long>()
                 fun collect(n: CategoryNode) {
                     result.add(n.entity.id)
@@ -260,10 +286,103 @@ class NoteViewModel(application: Application) : AndroidViewModel(application) {
                 collect(node)
                 return result
             }
-            // 递归搜索子树
             collectIds(node.children, targetId)?.let { return it }
         }
         return null
+    }
+
+    /** 收集隐藏分类及其所有后代的 id */
+    private fun expandHiddenCategoryIds(hidden: Set<Long>, tree: List<CategoryNode>): Set<Long> {
+        val result = mutableSetOf<Long>()
+        hidden.forEach { id ->
+            collectIds(tree, id)?.let { result.addAll(it) }
+        }
+        return result
+    }
+
+    private fun buildCategoryPathMap(tree: List<CategoryNode>, prefix: String = ""): Map<String, Long> {
+        val map = mutableMapOf<String, Long>()
+        fun walk(nodes: List<CategoryNode>, currentPrefix: String) {
+            nodes.forEach { node ->
+                val path = if (currentPrefix.isEmpty()) node.entity.name else "$currentPrefix/${node.entity.name}"
+                map[path] = node.entity.id
+                walk(node.children, path)
+            }
+        }
+        walk(tree, prefix)
+        return map
+    }
+
+    private fun buildCategoryPath(categoryId: Long, all: List<CategoryEntity>): String? {
+        val entity = all.firstOrNull { it.id == categoryId } ?: return null
+        val segments = mutableListOf<String>()
+        var current: CategoryEntity? = entity
+        while (current != null) {
+            segments.add(0, current.name)
+            current = current.parentId?.let { parentId -> all.firstOrNull { it.id == parentId } }
+        }
+        return segments.joinToString("/")
+    }
+
+    private fun parseExportCategories(root: JSONObject, notes: JSONArray): List<CategoryExportItem> {
+        val categories = root.optJSONArray("categories")
+        if (categories != null && categories.length() > 0) {
+            return buildList {
+                for (i in 0 until categories.length()) {
+                    val obj = categories.optJSONObject(i) ?: continue
+                    val path = obj.optString("path", "").trim()
+                    if (path.isBlank()) continue
+                    add(
+                        CategoryExportItem(
+                            path = path,
+                            colorHex = obj.optString("colorHex", "#6C63FF")
+                        )
+                    )
+                }
+            }.sortedBy { it.path.count { ch -> ch == '/' } }
+        }
+
+        val paths = linkedSetOf<String>()
+        for (i in 0 until notes.length()) {
+            val obj = notes.optJSONObject(i) ?: continue
+            val path = obj.optString("categoryPath", "").trim()
+                .ifBlank { obj.optString("categoryName", "").trim() }
+            if (path.isNotBlank()) paths.add(path)
+        }
+        return paths.map { CategoryExportItem(path = it) }
+            .sortedBy { it.path.count { ch -> ch == '/' } }
+    }
+
+    private suspend fun ensureCategoryPath(
+        path: String?,
+        pathMap: MutableMap<String, Long>,
+        colorByPath: Map<String, String> = emptyMap()
+    ): Long? {
+        val normalized = path?.trim().orEmpty()
+        if (normalized.isBlank()) return null
+        pathMap[normalized]?.let { return it }
+
+        val segments = normalized.split("/").filter { it.isNotBlank() }
+        var parentId: Long? = null
+        var currentPath = ""
+        for (segment in segments) {
+            currentPath = if (currentPath.isEmpty()) segment else "$currentPath/$segment"
+            val existingId = pathMap[currentPath]
+            if (existingId != null) {
+                parentId = existingId
+                continue
+            }
+            val newId = catRepo.insert(
+                CategoryEntity(
+                    name = segment,
+                    parentId = parentId,
+                    colorHex = colorByPath[currentPath] ?: "#6C63FF"
+                )
+            )
+            pathMap[currentPath] = newId
+            parentId = newId
+        }
+        return parentId
     }
 
     // ── 分类操作 ──
@@ -287,6 +406,21 @@ class NoteViewModel(application: Application) : AndroidViewModel(application) {
     }
     fun renameCategory(cat: CategoryEntity, newName: String, newColor: String = cat.colorHex) {
         viewModelScope.launch { catRepo.update(cat.copy(name = newName.trim(), colorHex = newColor)) }
+    }
+    fun moveCategory(cat: CategoryEntity, newParentId: Long?) {
+        viewModelScope.launch {
+            val error = catRepo.moveCategory(cat, newParentId)
+            if (error != null) {
+                _uiState.update { it.copy(snackbarMessage = error) }
+            }
+        }
+    }
+    fun toggleHideCategory(categoryId: Long) {
+        _uiState.update { state ->
+            val hidden = state.hiddenCategoryIds
+            val updated = if (categoryId in hidden) hidden - categoryId else hidden + categoryId
+            state.copy(hiddenCategoryIds = updated, currentPagerIndex = 0)
+        }
     }
     // fun deleteCategory(cat: CategoryEntity) {
     //     viewModelScope.launch {
@@ -359,14 +493,15 @@ class NoteViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             _uiState.update { it.copy(isLoading = true) }
             try {
-                val (conflictType, matched) = findNameConflict(name.trim())
-                when (conflictType) {
+                val conflict = findNameConflict(name.trim())
+                when (conflict.type) {
                     ConflictType.EXACT -> {
                         pendingSaveAction = null
                         _uiState.update {
                             it.copy(
-                                duplicateNameDialogMessage = "已存在同名笔记：$matched",
-                                duplicateNameCanForceSave = false
+                                duplicateNameDialogMessage = "已存在同名笔记：${conflict.matchedName}",
+                                duplicateNameCanForceSave = false,
+                                duplicateConflictNoteId = conflict.matchedNoteId
                             )
                         }
                         return@launch
@@ -382,8 +517,9 @@ class NoteViewModel(application: Application) : AndroidViewModel(application) {
                         )
                         _uiState.update {
                             it.copy(
-                                duplicateNameDialogMessage = "发现相似笔记：$matched\n仍要保存吗？",
-                                duplicateNameCanForceSave = true
+                                duplicateNameDialogMessage = "发现相似笔记：${conflict.matchedName}\n仍要保存吗？",
+                                duplicateNameCanForceSave = true,
+                                duplicateConflictNoteId = conflict.matchedNoteId
                             )
                         }
                         return@launch
@@ -417,14 +553,15 @@ class NoteViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             _uiState.update { it.copy(isLoading = true) }
             try {
-                val (conflictType, matched) = findNameConflict(name, excludeNoteId = note.id)
-                when (conflictType) {
+                val conflict = findNameConflict(name, excludeNoteId = note.id)
+                when (conflict.type) {
                     ConflictType.EXACT -> {
                         pendingSaveAction = null
                         _uiState.update {
                             it.copy(
-                                duplicateNameDialogMessage = "已存在同名笔记：$matched",
-                                duplicateNameCanForceSave = false
+                                duplicateNameDialogMessage = "已存在同名笔记：${conflict.matchedName}",
+                                duplicateNameCanForceSave = false,
+                                duplicateConflictNoteId = conflict.matchedNoteId
                             )
                         }
                         return@launch
@@ -442,8 +579,9 @@ class NoteViewModel(application: Application) : AndroidViewModel(application) {
                         )
                         _uiState.update {
                             it.copy(
-                                duplicateNameDialogMessage = "发现相似笔记：$matched\n仍要保存吗？",
-                                duplicateNameCanForceSave = true
+                                duplicateNameDialogMessage = "发现相似笔记：${conflict.matchedName}\n仍要保存吗？",
+                                duplicateNameCanForceSave = true,
+                                duplicateConflictNoteId = conflict.matchedNoteId
                             )
                         }
                         return@launch
@@ -536,15 +674,18 @@ class NoteViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             runCatching {
                 val allNotes = noteRepo.getAllNotesSnapshot()
-                val categories = _uiState.value.categoryTree
-                val categoryNameById = mutableMapOf<Long, String>()
-                fun walk(nodes: List<CategoryNode>) {
-                    nodes.forEach { node ->
-                        categoryNameById[node.entity.id] = node.entity.name
-                        walk(node.children)
-                    }
+                val allCategories = catRepo.getAllCategoriesSnapshot()
+
+                val categoriesArray = JSONArray()
+                allCategories.forEach { category ->
+                    val path = buildCategoryPath(category.id, allCategories) ?: return@forEach
+                    categoriesArray.put(
+                        JSONObject().apply {
+                            put("path", path)
+                            put("colorHex", category.colorHex)
+                        }
+                    )
                 }
-                walk(categories)
 
                 val notesArray = JSONArray()
                 val exportedImagePathMap = mutableMapOf<String, String>()
@@ -570,14 +711,18 @@ class NoteViewModel(application: Application) : AndroidViewModel(application) {
                             put("url", note.url)
                             put("isDownloaded", note.isDownloaded)
                             put("remarks", note.remarks)
-                            put("categoryName", note.categoryId?.let { categoryNameById[it] })
+                            put(
+                                "categoryPath",
+                                note.categoryId?.let { buildCategoryPath(it, allCategories) }
+                            )
                             put("images", JSONArray(exportedImages))
                         }
                     )
                 }
                 val payload = JSONObject().apply {
-                    put("schemaVersion", 2)
+                    put("schemaVersion", 3)
                     put("exportedAt", System.currentTimeMillis())
+                    put("categories", categoriesArray)
                     put("notes", notesArray)
                 }
                 appCtx.contentResolver.openOutputStream(uri)?.use { outStream ->
@@ -610,16 +755,20 @@ class NoteViewModel(application: Application) : AndroidViewModel(application) {
                     readImportPayloadFromZip(input)
                 } ?: error("无法读取导入文件")
                 val notes = importPayload.root.optJSONArray("notes") ?: JSONArray()
+                val importCategories = parseExportCategories(importPayload.root, notes)
                 val existed = noteRepo.getAllNotesSnapshot()
                 val importItems = mutableListOf<ImportReviewItem>()
                 for (i in 0 until notes.length()) {
                     val obj = notes.optJSONObject(i) ?: continue
+                    val categoryPath = obj.optString("categoryPath", "").trim()
+                        .ifBlank { obj.optString("categoryName", "").trim() }
+                        .ifBlank { null }
                     val draft = NoteImportDraft(
                         name = obj.optString("name", "").trim(),
                         url = obj.optString("url", "").trim(),
                         isDownloaded = obj.optBoolean("isDownloaded", false),
                         remarks = obj.optString("remarks", "").trim(),
-                        categoryName = obj.optString("categoryName", "").trim().ifBlank { null },
+                        categoryPath = categoryPath,
                         imageBytesList = buildList {
                             val arr = obj.optJSONArray("images") ?: JSONArray()
                             for (j in 0 until arr.length()) {
@@ -666,9 +815,9 @@ class NoteViewModel(application: Application) : AndroidViewModel(application) {
                         )
                     }
                 }
-                importItems
-            }.onSuccess { items ->
-                _uiState.update { it.copy(importReviewItems = items) }
+                importItems to importCategories
+            }.onSuccess { (items, categories) ->
+                _uiState.update { it.copy(importReviewItems = items, pendingImportCategories = categories) }
             }.onFailure { e ->
                 _uiState.update { it.copy(snackbarMessage = "导入解析失败：${e.message}") }
             }
@@ -686,32 +835,35 @@ class NoteViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun closeImportReview() {
-        _uiState.update { it.copy(importReviewItems = emptyList()) }
+        _uiState.update { it.copy(importReviewItems = emptyList(), pendingImportCategories = emptyList()) }
     }
 
     fun confirmImportSelected() {
         viewModelScope.launch {
             val items = _uiState.value.importReviewItems.filter { it.selected }
             if (items.isEmpty()) {
-                _uiState.update { it.copy(importReviewItems = emptyList(), snackbarMessage = "没有可导入的笔记") }
+                _uiState.update {
+                    it.copy(
+                        importReviewItems = emptyList(),
+                        pendingImportCategories = emptyList(),
+                        snackbarMessage = "没有可导入的笔记"
+                    )
+                }
                 return@launch
             }
             var count = 0
-            val categoryMap = mutableMapOf<String, Long>()
-            val allCategories = _uiState.value.categoryTree
-            fun walk(nodes: List<CategoryNode>) {
-                nodes.forEach { node ->
-                    categoryMap.putIfAbsent(node.entity.name.trim(), node.entity.id)
-                    walk(node.children)
-                }
+            val pathMap = buildCategoryPathMap(_uiState.value.categoryTree).toMutableMap()
+            val colorByPath = _uiState.value.pendingImportCategories.associate { it.path to it.colorHex }
+
+            _uiState.value.pendingImportCategories.forEach { category ->
+                ensureCategoryPath(category.path, pathMap, colorByPath)
             }
-            walk(allCategories)
+            items.mapNotNull { it.draft.categoryPath }.distinct().forEach { path ->
+                ensureCategoryPath(path, pathMap, colorByPath)
+            }
 
             items.forEach { item ->
-                val categoryId = item.draft.categoryName?.let { name ->
-                    val key = name.trim()
-                    categoryMap[key] ?: catRepo.insert(CategoryEntity(name = key)).also { categoryMap[key] = it }
-                }
+                val categoryId = ensureCategoryPath(item.draft.categoryPath, pathMap, colorByPath)
                 val binaryImportedPaths = writeRawImagesToPrivateStorage(
                     context = appCtx,
                     imageBytesList = item.draft.imageBytesList
@@ -746,13 +898,54 @@ class NoteViewModel(application: Application) : AndroidViewModel(application) {
                 }
                 count++
             }
-            _uiState.update { it.copy(importReviewItems = emptyList(), snackbarMessage = "已导入 $count 条笔记") }
+            _uiState.update {
+                it.copy(
+                    importReviewItems = emptyList(),
+                    pendingImportCategories = emptyList(),
+                    snackbarMessage = "已导入 $count 条笔记"
+                )
+            }
         }
+    }
+
+    fun navigateToDuplicateNote() {
+        val noteId = _uiState.value.duplicateConflictNoteId ?: return
+        clearDuplicateNameDialog()
+        _uiState.update { it.copy(showAddSheet = false, noteToEdit = null) }
+        viewModelScope.launch {
+            val note = noteRepo.getNoteById(noteId) ?: return@launch
+            val tree = _uiState.value.categoryTree
+            val hidden = _uiState.value.hiddenCategoryIds
+            val categoryId = note.categoryId
+            val toUnhide = if (categoryId != null) {
+                hidden.filter { id -> collectIds(tree, id)?.contains(categoryId) == true }
+            } else emptyList()
+            _uiState.update {
+                it.copy(
+                    selectedCategoryId = categoryId,
+                    hiddenCategoryIds = it.hiddenCategoryIds - toUnhide.toSet(),
+                    isSearchActive = false,
+                    searchQuery = ""
+                )
+            }
+            _rawSearch.value = ""
+            _scrollToNoteId.value = noteId
+        }
+    }
+
+    fun consumeScrollToNoteId() {
+        _scrollToNoteId.value = null
     }
 
     fun clearDuplicateNameDialog() {
         pendingSaveAction = null
-        _uiState.update { it.copy(duplicateNameDialogMessage = null, duplicateNameCanForceSave = false) }
+        _uiState.update {
+            it.copy(
+                duplicateNameDialogMessage = null,
+                duplicateNameCanForceSave = false,
+                duplicateConflictNoteId = null
+            )
+        }
     }
 
     fun clearSnackbar() { _uiState.update { it.copy(snackbarMessage = null) } }

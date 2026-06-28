@@ -38,6 +38,6 @@ interface CategoryDao {
     @Query("DELETE FROM categories WHERE id = :id")
     suspend fun deleteCategoryById(id: Long)
 
-    
-   
+    @Query("SELECT * FROM categories ORDER BY parentId ASC, sortOrder ASC, id ASC")
+    suspend fun getAllCategoriesSnapshot(): List<CategoryEntity>
 }
