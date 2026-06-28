@@ -142,7 +142,7 @@ class NoteViewModel(application: Application) : AndroidViewModel(application) {
     private var pendingSaveAction: PendingSaveAction? = null
 
     private fun normalizeName(value: String): String =
-        value.lowercase().replace("\\s+".toRegex(), "")
+        value.filter { it.isLetterOrDigit() }.lowercase()
 
     private fun levenshteinSimilarity(a: String, b: String): Double {
         if (a == b) return 1.0

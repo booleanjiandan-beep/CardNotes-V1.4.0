@@ -361,7 +361,7 @@ fun CategoryNodeItem(
     var showAddChild by remember { mutableStateOf(false) }
     var showRename   by remember { mutableStateOf(false) }
     var showMove     by remember { mutableStateOf(false) }
-    var expanded     by remember { mutableStateOf(true) }
+    var expanded     by remember { mutableStateOf(false) }
     val canAddChild  = node.depth < 3
     val accentColor  = parseColor(node.entity.colorHex)
     val isHidden     = node.entity.id in hiddenCategoryIds
@@ -990,11 +990,18 @@ fun NoteCard(
                         HighlightText(note.name, searchQuery, Color.White, 20.sp, 2, FontWeight.Bold)
                     }
                     if (note.name.isNotBlank()) {
-                        IconButton(onClick = {
-                            val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                            cm.setPrimaryClip(ClipData.newPlainText("name", note.name))
-                        }, modifier = Modifier.size(28.dp).clip(RoundedCornerShape(6.dp)).background(Color(0xFF6C63FF).copy(0.15f))) {
-                            Icon(Icons.Default.ContentCopy, "复制名称", tint = Color(0xFF6C63FF), modifier = Modifier.size(14.dp))
+                        Box(
+                            modifier = Modifier
+                                .size(20.dp)
+                                .clip(RoundedCornerShape(4.dp))
+                                .background(Color(0xFF6C63FF).copy(0.15f))
+                                .clickable {
+                                    val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                                    cm.setPrimaryClip(ClipData.newPlainText("name", note.name))
+                                },
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Icon(Icons.Default.ContentCopy, "复制名称", tint = Color(0xFF6C63FF), modifier = Modifier.size(11.dp))
                         }
                     }
                 }
@@ -1004,11 +1011,18 @@ fun NoteCard(
                     Icon(Icons.Default.Link, null, tint = Color(0xFF6C63FF), modifier = Modifier.size(14.dp))
                     Box(modifier = Modifier.weight(1f)) { HighlightText(note.url, searchQuery, Color(0xFF6C63FF), 12.sp, 1) }
                     if (note.url.isNotBlank()) {
-                        IconButton(onClick = {
-                            val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                            cm.setPrimaryClip(ClipData.newPlainText("url", note.url))
-                        }, modifier = Modifier.size(28.dp).clip(RoundedCornerShape(6.dp)).background(Color(0xFF6C63FF).copy(0.15f))) {
-                            Icon(Icons.Default.ContentCopy, "复制", tint = Color(0xFF6C63FF), modifier = Modifier.size(14.dp))
+                        Box(
+                            modifier = Modifier
+                                .size(20.dp)
+                                .clip(RoundedCornerShape(4.dp))
+                                .background(Color(0xFF6C63FF).copy(0.15f))
+                                .clickable {
+                                    val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                                    cm.setPrimaryClip(ClipData.newPlainText("url", note.url))
+                                },
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Icon(Icons.Default.ContentCopy, "复制", tint = Color(0xFF6C63FF), modifier = Modifier.size(11.dp))
                         }
                     }
                 }
