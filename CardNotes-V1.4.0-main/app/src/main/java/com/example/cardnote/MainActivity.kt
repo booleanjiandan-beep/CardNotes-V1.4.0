@@ -16,6 +16,11 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.*
 import androidx.compose.animation.core.*
 import androidx.compose.foundation.*
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.calculateCentroidSize
+import androidx.compose.foundation.gestures.calculatePan
+import androidx.compose.foundation.gestures.calculateZoom
+import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.pager.*
@@ -33,12 +38,21 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
+import androidx.compose.ui.input.nestedscroll.nestedScroll
+import androidx.compose.ui.input.pointer.PointerInputScope
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.input.pointer.positionChanged
+import androidx.compose.ui.unit.IntSize
+import androidx.compose.ui.unit.Velocity
+import androidx.compose.ui.zIndex
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -60,14 +74,14 @@ import com.example.cardnote.ui.CategoryNode
 import com.example.cardnote.ui.ConflictType
 import com.example.cardnote.ui.FilterState
 import com.example.cardnote.ui.ImportReviewItem
+import com.example.cardnote.ui.NoteCategoryFilter
 import com.example.cardnote.ui.NoteViewModel
+import com.example.cardnote.ui.SheetImage
 import com.example.cardnote.ui.theme.CardNoteTheme
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.io.File
 import kotlin.math.abs
-import androidx.compose.foundation.interaction.MutableInteractionSource
-
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -116,21 +130,27 @@ fun CardNoteApp(vm: NoteViewModel = viewModel()) {
     BackHandler(uiState.isCategoryDrawerOpen) { vm.closeCategoryDrawer() }
 
     // 选中分类名称 + 颜色
-    val selectedCatName = remember(uiState.selectedCategoryId, uiState.categoryTree) {
-        fun findName(nodes: List<CategoryNode>, id: Long?): String? {
-            if (id == null) return null
+    val selectedCatName = remember(uiState.categoryFilter, uiState.categoryTree) {
+        fun findName(nodes: List<CategoryNode>, id: Long): String? {
             for (n in nodes) { if (n.entity.id == id) return n.entity.name; findName(n.children, id)?.let { return it } }
             return null
         }
-        findName(uiState.categoryTree, uiState.selectedCategoryId)
+        when (val filter = uiState.categoryFilter) {
+            NoteCategoryFilter.All -> null
+            NoteCategoryFilter.Uncategorized -> "未分类"
+            is NoteCategoryFilter.InCategory -> findName(uiState.categoryTree, filter.id)
+        }
     }
-    val selectedCatColor = remember(uiState.selectedCategoryId, uiState.categoryTree) {
-        fun findColor(nodes: List<CategoryNode>, id: Long?): String? {
-            if (id == null) return null
+    val selectedCatColor = remember(uiState.categoryFilter, uiState.categoryTree) {
+        fun findColor(nodes: List<CategoryNode>, id: Long): String? {
             for (n in nodes) { if (n.entity.id == id) return n.entity.colorHex; findColor(n.children, id)?.let { return it } }
             return null
         }
-        parseColor(findColor(uiState.categoryTree, uiState.selectedCategoryId) ?: "#6C63FF")
+        when (val filter = uiState.categoryFilter) {
+            NoteCategoryFilter.Uncategorized -> Color(0xFF9AA0B4)
+            is NoteCategoryFilter.InCategory -> parseColor(findColor(uiState.categoryTree, filter.id) ?: "#6C63FF")
+            NoteCategoryFilter.All -> Color(0xFF6C63FF)
+        }
     }
 
     Scaffold(
@@ -157,9 +177,13 @@ fun CardNoteApp(vm: NoteViewModel = viewModel()) {
             ) {
                 CategoryDrawer(
                     tree = uiState.categoryTree,
-                    selectedId = uiState.selectedCategoryId,
+                    filter = uiState.categoryFilter,
+                    expandedCategoryIds = uiState.expandedCategoryIds,
                     hiddenCategoryIds = uiState.hiddenCategoryIds,
+                    onSelectAll = { vm.selectAllNotes(); vm.closeCategoryDrawer() },
+                    onSelectUncategorized = { vm.selectUncategorized(); vm.closeCategoryDrawer() },
                     onSelect   = { id -> vm.selectCategory(id); vm.closeCategoryDrawer() },
+                    onToggleExpanded = vm::toggleCategoryExpanded,
                     onAddRoot  = { name, color -> vm.addCategory(name, null, color) },
                     onAddChild = { name, pid, color -> vm.addCategory(name, pid, color) },
                     onRename   = { cat, name, color -> vm.renameCategory(cat, name, color) },
@@ -214,15 +238,16 @@ fun CardNoteApp(vm: NoteViewModel = viewModel()) {
     // sheets / dialogs
     if (uiState.showAddSheet) {
         NoteBottomSheet(isLoading = uiState.isLoading, existingNote = null,
-            categoryTree = uiState.categoryTree, initialCategoryId = uiState.selectedCategoryId,
+            categoryTree = uiState.categoryTree,
+            initialCategoryId = (uiState.categoryFilter as? NoteCategoryFilter.InCategory)?.id,
             onDismiss = { vm.hideAddSheet() },
-            onConfirm = { name, url, dl, rem, kept, uris, catId -> vm.addNote(name, url, dl, rem, uris, catId) })
+            onConfirm = { name, url, dl, rem, images, catId -> vm.addNote(name, url, dl, rem, images, catId) })
     }
     uiState.noteToEdit?.let { note ->
         NoteBottomSheet(isLoading = uiState.isLoading, existingNote = note,
             categoryTree = uiState.categoryTree, initialCategoryId = note.categoryId,
             onDismiss = { vm.hideEditSheet() },
-            onConfirm = { name, url, dl, rem, kept, uris, catId -> vm.saveEdit(note, name, url, dl, rem, kept, uris, catId) })
+            onConfirm = { name, url, dl, rem, images, catId -> vm.saveEdit(note, name, url, dl, rem, images, catId) })
     }
     uiState.noteToDelete?.let { note ->
         DeleteConfirmDialog(noteName = note.name, imageCount = note.images.size,
@@ -294,9 +319,14 @@ fun CardNoteApp(vm: NoteViewModel = viewModel()) {
 // ═══════════════════════════════════════
 @Composable
 fun CategoryDrawer(
-    tree: List<CategoryNode>, selectedId: Long?,
+    tree: List<CategoryNode>,
+    filter: NoteCategoryFilter,
+    expandedCategoryIds: Set<Long>,
     hiddenCategoryIds: Set<Long> = emptySet(),
-    onSelect: (Long?) -> Unit,
+    onSelectAll: () -> Unit,
+    onSelectUncategorized: () -> Unit,
+    onSelect: (Long) -> Unit,
+    onToggleExpanded: (Long) -> Unit,
     onAddRoot: (name: String, color: String) -> Unit,
     onAddChild: (name: String, parentId: Long, color: String) -> Unit,
     onRename: (cat: CategoryEntity, newName: String, newColor: String) -> Unit,
@@ -325,13 +355,20 @@ fun CategoryDrawer(
             Divider(color = Color(0xFF2A2A38))
             Column(modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(vertical = 8.dp)) {
                 CategoryItem(label = "全部笔记", icon = Icons.Default.LibraryBooks, accentColor = Color(0xFF6C63FF),
-                    selected = selectedId == null, depth = 0, isFolder = false,
-                    onSelect = { onSelect(null) }, canAddChild = false,
+                    selected = filter is NoteCategoryFilter.All, depth = 0, isFolder = false,
+                    showActions = false,
+                    onSelect = onSelectAll, canAddChild = false,
+                    onAddChild = {}, onRename = {}, onDelete = {})
+                CategoryItem(label = "未分类", icon = Icons.Default.FolderOff, accentColor = Color(0xFF9AA0B4),
+                    selected = filter is NoteCategoryFilter.Uncategorized, depth = 0, isFolder = false,
+                    showActions = false,
+                    onSelect = onSelectUncategorized, canAddChild = false,
                     onAddChild = {}, onRename = {}, onDelete = {})
                 Divider(color = Color(0xFF1E1E2E), modifier = Modifier.padding(vertical = 4.dp))
                 tree.forEach { node ->
                     CategoryNodeItem(
-                        node, tree, selectedId, hiddenCategoryIds, onSelect, onAddChild, onRename, onMove, onToggleHide, onDelete
+                        node, tree, filter, expandedCategoryIds, hiddenCategoryIds,
+                        onSelect, onToggleExpanded, onAddChild, onRename, onMove, onToggleHide, onDelete
                     )
                 }
             }
@@ -349,9 +386,11 @@ fun CategoryDrawer(
 fun CategoryNodeItem(
     node: CategoryNode,
     tree: List<CategoryNode>,
-    selectedId: Long?,
+    filter: NoteCategoryFilter,
+    expandedCategoryIds: Set<Long>,
     hiddenCategoryIds: Set<Long>,
-    onSelect: (Long?) -> Unit,
+    onSelect: (Long) -> Unit,
+    onToggleExpanded: (Long) -> Unit,
     onAddChild: (name: String, parentId: Long, color: String) -> Unit,
     onRename: (cat: CategoryEntity, newName: String, newColor: String) -> Unit,
     onMove: (cat: CategoryEntity, newParentId: Long?) -> Unit,
@@ -361,19 +400,20 @@ fun CategoryNodeItem(
     var showAddChild by remember { mutableStateOf(false) }
     var showRename   by remember { mutableStateOf(false) }
     var showMove     by remember { mutableStateOf(false) }
-    var expanded     by remember { mutableStateOf(false) }
+    val expanded     = node.entity.id in expandedCategoryIds
     val canAddChild  = node.depth < 3
     val accentColor  = parseColor(node.entity.colorHex)
     val isHidden     = node.entity.id in hiddenCategoryIds
+    val selected     = filter is NoteCategoryFilter.InCategory && filter.id == node.entity.id
 
     CategoryItem(
         label = node.entity.name,
         icon = if (node.children.isEmpty()) Icons.Default.Label else Icons.Default.Folder,
         accentColor = accentColor,
-        selected = selectedId == node.entity.id, depth = node.depth,
+        selected = selected, depth = node.depth,
         isFolder = node.children.isNotEmpty(),
         isHidden = isHidden,
-        expanded = expanded, onToggleExpand = { expanded = !expanded },
+        expanded = expanded, onToggleExpand = { onToggleExpanded(node.entity.id) },
         onSelect = { onSelect(node.entity.id) },
         canAddChild = canAddChild,
         onAddChild = { showAddChild = true },
@@ -387,7 +427,8 @@ fun CategoryNodeItem(
         Column {
             node.children.forEach { child ->
                 CategoryNodeItem(
-                    child, tree, selectedId, hiddenCategoryIds, onSelect, onAddChild, onRename, onMove, onToggleHide, onDelete
+                    child, tree, filter, expandedCategoryIds, hiddenCategoryIds,
+                    onSelect, onToggleExpanded, onAddChild, onRename, onMove, onToggleHide, onDelete
                 )
             }
         }
@@ -430,6 +471,7 @@ fun CategoryItem(
     accentColor: Color = Color(0xFF6C63FF),
     selected: Boolean, depth: Int, isFolder: Boolean,
     isHidden: Boolean = false,
+    showActions: Boolean = true,
     expanded: Boolean = false, onToggleExpand: () -> Unit = {},
     onSelect: () -> Unit, canAddChild: Boolean,
     onAddChild: () -> Unit, onRename: () -> Unit, onMove: () -> Unit = {},
@@ -470,7 +512,7 @@ fun CategoryItem(
             Icon(Icons.Default.VisibilityOff, "已隐藏", tint = Color(0xFF666688), modifier = Modifier.size(14.dp))
         }
 
-        if (onRename != {}) {
+        if (showActions) {
             Box {
                 IconButton(onClick = { showMenu = true }, modifier = Modifier.size(24.dp)) {
                     Icon(Icons.Default.MoreVert, null, tint = Color(0xFF555566), modifier = Modifier.size(16.dp))
@@ -1094,11 +1136,11 @@ fun FullscreenImageDialog(
     startIndex: Int,
     onDismiss: () -> Unit
 ) {
-    val context = LocalContext.current
     val pager = rememberPagerState(
         initialPage = startIndex,
         pageCount = { images.size }
     )
+    var zoomed by remember { mutableStateOf(false) }
 
     Dialog(
         onDismissRequest = onDismiss,
@@ -1114,49 +1156,19 @@ fun FullscreenImageDialog(
             modifier = Modifier
                 .fillMaxSize()
                 .background(Color.Black)
-                .combinedClickable(
-                    indication = null,
-                    interactionSource = remember { MutableInteractionSource() },
-                    onClick = { onDismiss() } // 单击关闭
-                )
         ) {
 
             // 👉 图片 Pager
             HorizontalPager(
                 state = pager,
-                modifier = Modifier.fillMaxSize()
+                modifier = Modifier.fillMaxSize(),
+                userScrollEnabled = !zoomed
             ) { i ->
-
-                val path = images[i]
-
-                Box(
-                    modifier = Modifier
-                        .fillMaxSize()
-                        // ⚠️ 关键：拦截点击，防止传递给外层关闭
-                        .combinedClickable(
-                            indication = null,
-                            interactionSource = remember { MutableInteractionSource() },
-
-                            onClick = {
-                                // 单击图片 👉 不关闭（拦截）
-                            },
-
-                            onDoubleClick = {
-                                // 👉 这里可以扩展：双击缩放
-                                // 目前先留空（你后续可以加 scale）
-                            }
-                        )
-                ) {
-                    AsyncImage(
-                        model = ImageRequest.Builder(context)
-                            .data(if (path.startsWith("/")) File(path) else Uri.parse(path))
-                            .crossfade(true)
-                            .build(),
-                        contentDescription = null,
-                        modifier = Modifier.fillMaxSize(),
-                        contentScale = ContentScale.Fit
-                    )
-                }
+                ZoomableNoteImage(
+                    path = images[i],
+                    isCurrentPage = pager.currentPage == i,
+                    onZoomedChange = { if (pager.currentPage == i) zoomed = it }
+                )
             }
 
             // 👉 关闭按钮
@@ -1194,10 +1206,10 @@ fun FullscreenImageDialog(
             Box(
                 modifier = Modifier
                     .align(Alignment.BottomCenter)
-                    .padding(bottom = 14.dp)
+                    .padding(bottom = if (images.size > 1) 72.dp else 14.dp)
             ) {
                 Text(
-                    "点击空白处关闭",
+                    "双指缩放 · 点右上角关闭",
                     color = Color.White.copy(0.45f),
                     fontSize = 11.sp
                 )
@@ -1206,6 +1218,102 @@ fun FullscreenImageDialog(
     }
 }
 
+
+@Composable
+private fun ZoomableNoteImage(
+    path: String,
+    isCurrentPage: Boolean,
+    onZoomedChange: (Boolean) -> Unit
+) {
+    val context = LocalContext.current
+    val scaleState = remember { mutableFloatStateOf(1f) }
+    val offsetState = remember { mutableStateOf(Offset.Zero) }
+    val currentPageState = rememberUpdatedState(isCurrentPage)
+    val zoomCallback = rememberUpdatedState(onZoomedChange)
+    LaunchedEffect(isCurrentPage) {
+        if (!isCurrentPage) {
+            scaleState.floatValue = 1f
+            offsetState.value = Offset.Zero
+            onZoomedChange(false)
+        }
+    }
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .pointerInput(Unit) {
+                detectPinchAndPan(scaleState, offsetState) { zoomed ->
+                    if (currentPageState.value) zoomCallback.value(zoomed)
+                }
+            }
+    ) {
+        AsyncImage(
+            model = ImageRequest.Builder(context)
+                .data(if (path.startsWith("/")) File(path) else Uri.parse(path))
+                .crossfade(true)
+                .build(),
+            contentDescription = null,
+            modifier = Modifier
+                .fillMaxSize()
+                .graphicsLayer {
+                    scaleX = scaleState.floatValue
+                    scaleY = scaleState.floatValue
+                    translationX = offsetState.value.x
+                    translationY = offsetState.value.y
+                },
+            contentScale = ContentScale.Fit
+        )
+    }
+}
+
+private suspend fun PointerInputScope.detectPinchAndPan(
+    scaleState: MutableFloatState,
+    offsetState: MutableState<Offset>,
+    onZoomed: (Boolean) -> Unit
+) {
+    val touchSlop = viewConfiguration.touchSlop
+    awaitEachGesture {
+        var pastSlop = false
+        var zoomAccum = 1f
+        var panAccum = Offset.Zero
+        do {
+            val event = awaitPointerEvent()
+            val pressedCount = event.changes.count { it.pressed }
+            val zoomChange = event.calculateZoom()
+            val panChange = event.calculatePan()
+            if (pressedCount >= 2) {
+                event.changes.forEach { it.consume() }
+            }
+            if (!pastSlop) {
+                zoomAccum *= zoomChange
+                panAccum += panChange
+                val zoomMotion = abs(1f - zoomAccum) * event.calculateCentroidSize(useCurrent = false)
+                if (zoomMotion > touchSlop || (scaleState.floatValue > 1f && panAccum.getDistance() > touchSlop)) {
+                    pastSlop = true
+                }
+            }
+            val zoomedAlready = scaleState.floatValue > 1f
+            if (pastSlop && (pressedCount >= 2 || zoomedAlready)) {
+                val settled = (scaleState.floatValue * zoomChange).coerceIn(1f, 5f).let {
+                    if (it <= 1.01f) 1f else it
+                }
+                scaleState.floatValue = settled
+                offsetState.value = if (settled == 1f) {
+                    Offset.Zero
+                } else {
+                    clampImageOffset(offsetState.value + panChange, settled, size)
+                }
+                onZoomed(settled > 1f)
+                event.changes.forEach { if (it.positionChanged()) it.consume() }
+            }
+        } while (event.changes.any { it.pressed })
+    }
+}
+
+private fun clampImageOffset(offset: Offset, scale: Float, size: IntSize): Offset {
+    val maxX = size.width * (scale - 1f) / 2f
+    val maxY = size.height * (scale - 1f) / 2f
+    return Offset(offset.x.coerceIn(-maxX, maxX), offset.y.coerceIn(-maxY, maxY))
+}
 
 // @OptIn(ExperimentalFoundationApi::class)
 // @Composable
@@ -1261,10 +1369,23 @@ fun NoteBottomSheet(
     categoryTree: List<CategoryNode>, initialCategoryId: Long?,
     onDismiss: () -> Unit,
     onConfirm: (name: String, url: String, isDownloaded: Boolean, remarks: String,
-                keptPaths: List<String>, newImageUris: List<Uri>, categoryId: Long?) -> Unit
+                images: List<SheetImage>, categoryId: Long?) -> Unit
 ) {
     val context = LocalContext.current
-    val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+    val sheetState = rememberModalBottomSheetState(
+        skipPartiallyExpanded = true,
+        confirmValueChange = { it != SheetValue.Hidden }
+    )
+    val blockSheetDismiss = remember {
+        object : NestedScrollConnection {
+            override fun onPostScroll(consumed: Offset, available: Offset, source: androidx.compose.ui.input.nestedscroll.NestedScrollSource): Offset {
+                return if (available.y > 0f) Offset(0f, available.y) else Offset.Zero
+            }
+            override suspend fun onPostFling(consumed: Velocity, available: Velocity): Velocity {
+                return if (available.y > 0f) available else Velocity.Zero
+            }
+        }
+    }
     val isEdit = existingNote != null
 
     var name         by remember { mutableStateOf(existingNote?.name    ?: "") }
@@ -1273,21 +1394,23 @@ fun NoteBottomSheet(
     var remarks      by remember { mutableStateOf(existingNote?.remarks ?: "") }
     var nameError    by remember { mutableStateOf(false) }
     var showImgSrc   by remember { mutableStateOf(false) }
-    var keptPaths    by remember { mutableStateOf(existingNote?.images ?: emptyList()) }
-    var newUris      by remember { mutableStateOf<List<Uri>>(emptyList()) }
+    var sheetImages by remember {
+        mutableStateOf(existingNote?.images?.map { SheetImage.Kept(it) } ?: emptyList())
+    }
     var selectedCat  by remember { mutableStateOf(initialCategoryId) }
     var showCatPicker by remember { mutableStateOf(false) }
 
-    // Bug fix: 改为普通函数，避免局部变量使用 get()
-    fun totalImageCount() = keptPaths.size + newUris.size
+    fun totalImageCount() = sheetImages.size
 
     var cameraUri by remember { mutableStateOf<Uri?>(null) }
     val galleryLauncher = rememberLauncherForActivityResult(ActivityResultContracts.GetMultipleContents()) { uris ->
-        val canAdd = 9 - totalImageCount()
-        newUris = (newUris + uris).distinct().take(newUris.size + canAdd.coerceAtLeast(0))
+        val canAdd = (9 - totalImageCount()).coerceAtLeast(0)
+        val existing = sheetImages.filterIsInstance<SheetImage.Fresh>().map { it.uri }.toSet()
+        val added = uris.filter { it !in existing }.take(canAdd).map { SheetImage.Fresh(it) }
+        sheetImages = sheetImages + added
     }
     val cameraLauncher = rememberLauncherForActivityResult(ActivityResultContracts.TakePicture()) { success ->
-        if (success) cameraUri?.let { if (totalImageCount() < 9) newUris = newUris + it }
+        if (success) cameraUri?.let { if (totalImageCount() < 9) sheetImages = sheetImages + SheetImage.Fresh(it) }
     }
     val cameraPermLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
         if (granted) { val f = File(context.cacheDir, "photo_${System.currentTimeMillis()}.jpg")
@@ -1306,7 +1429,7 @@ fun NoteBottomSheet(
         dragHandle = {
             Box(modifier = Modifier.padding(vertical = 12.dp).size(width = 40.dp, height = 4.dp).clip(CircleShape).background(Color(0xFF3A3A55)))
         }) {
-        Column(modifier = Modifier.fillMaxWidth().verticalScroll(rememberScrollState())
+        Column(modifier = Modifier.fillMaxWidth().nestedScroll(blockSheetDismiss).verticalScroll(rememberScrollState())
             .padding(horizontal = 20.dp).padding(bottom = 32.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
 
             Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
@@ -1355,14 +1478,18 @@ fun NoteBottomSheet(
 
             // 图片
             Text("图片", fontSize = 14.sp, color = Color(0xFF8888AA), fontWeight = FontWeight.Medium)
-            MixedImageGrid(keptPaths = keptPaths, newUris = newUris, onAddClick = { showImgSrc = true },
-                onRemoveKept = { keptPaths = keptPaths - it }, onRemoveNew = { newUris = newUris - it })
-            Text("图片将复制到应用私有存储（最多9张）", fontSize = 11.sp, color = Color(0xFF55556A))
+            MixedImageGrid(
+                items = sheetImages,
+                onReorder = { sheetImages = it },
+                onAddClick = { showImgSrc = true },
+                onRemove = { target -> sheetImages = sheetImages.filterNot { it.key == target.key } }
+            )
+            Text("长按图片可拖动排序，最多 9 张", fontSize = 11.sp, color = Color(0xFF55556A))
 
             Spacer(modifier = Modifier.height(4.dp))
             Button(onClick = {
                 if (name.isBlank()) nameError = true
-                else onConfirm(name, url, isDownloaded, remarks, keptPaths, newUris, selectedCat)
+                else onConfirm(name, url, isDownloaded, remarks, sheetImages, selectedCat)
             }, modifier = Modifier.fillMaxWidth().height(52.dp), shape = RoundedCornerShape(14.dp),
                 colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF6C63FF)), enabled = !isLoading) {
                 if (isLoading) CircularProgressIndicator(modifier = Modifier.size(20.dp), color = Color.White, strokeWidth = 2.dp)
@@ -1495,32 +1622,73 @@ fun CategoryPickerDialog(tree: List<CategoryNode>, selectedId: Long?, onSelect: 
 // 图片网格（旧路径 + 新URI 混合）
 // ═══════════════════════════════════════
 @Composable
-fun MixedImageGrid(keptPaths: List<String>, newUris: List<Uri>,
-                   onAddClick: () -> Unit, onRemoveKept: (String) -> Unit, onRemoveNew: (Uri) -> Unit) {
-    data class ImgItem(val data: Any, val isKept: Boolean, val key: Any)
-    val items: List<ImgItem?> = buildList {
-        keptPaths.forEach { add(ImgItem(File(it), true, it)) }
-        newUris.forEach   { add(ImgItem(it, false, it)) }
-        if (keptPaths.size + newUris.size < 9) add(null)
-    }
-    val cols = 3; val rows = (items.size + cols - 1) / cols
-    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        repeat(rows) { row ->
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                repeat(cols) { col ->
-                    val idx = row * cols + col
-                    Box(modifier = Modifier.weight(1f)) {
-                        when {
-                            idx >= items.size -> Spacer(modifier = Modifier.aspectRatio(1f))
-                            items[idx] == null -> AddImagePlaceholder(onClick = onAddClick)
-                            else -> {
-                                val item = items[idx]!!
-                                Box(modifier = Modifier.aspectRatio(1f)) {
-                                    AsyncImage(model = ImageRequest.Builder(LocalContext.current).data(item.data).crossfade(true).build(),
-                                        contentDescription = null, modifier = Modifier.fillMaxSize().clip(RoundedCornerShape(10.dp)), contentScale = ContentScale.Crop)
-                                    IconButton(onClick = { if (item.isKept) onRemoveKept(item.key as String) else onRemoveNew(item.key as Uri) },
-                                        modifier = Modifier.align(Alignment.TopEnd).padding(2.dp).size(24.dp).clip(CircleShape).background(Color.Black.copy(0.6f))) {
-                                        Icon(Icons.Default.Close, "移除", tint = Color.White, modifier = Modifier.size(14.dp))
+fun MixedImageGrid(
+    items: List<SheetImage>,
+    onReorder: (List<SheetImage>) -> Unit,
+    onAddClick: () -> Unit,
+    onRemove: (SheetImage) -> Unit
+) {
+    val itemsState = rememberUpdatedState(items)
+    var draggingKey by remember { mutableStateOf<String?>(null) }
+    var dragTranslation by remember { mutableStateOf(Offset.Zero) }
+    val gap = 8.dp
+    BoxWithConstraints(Modifier.fillMaxWidth()) {
+        val cell = (maxWidth - gap * 2) / 3
+        val density = LocalDensity.current
+        val cellPx = with(density) { cell.toPx() }
+        val gapPx = with(density) { gap.toPx() }
+        val stride = cellPx + gapPx
+        val showAdd = items.size < 9
+        val slotCount = items.size + if (showAdd) 1 else 0
+        val rows = (slotCount + 2) / 3
+        Column(verticalArrangement = Arrangement.spacedBy(gap)) {
+            repeat(rows) { row ->
+                Row(horizontalArrangement = Arrangement.spacedBy(gap)) {
+                    repeat(3) { col ->
+                        val slot = row * 3 + col
+                        Box(Modifier.weight(1f)) {
+                            when {
+                                slot >= slotCount -> Spacer(Modifier.aspectRatio(1f))
+                                slot == items.size && showAdd -> AddImagePlaceholder(onClick = onAddClick)
+                                else -> {
+                                    val item = items[slot]
+                                    key(item.key) {
+                                        ReorderableImageTile(
+                                            item = item,
+                                            dragging = draggingKey == item.key,
+                                            translation = if (draggingKey == item.key) dragTranslation else Offset.Zero,
+                                            onRemove = { onRemove(item) },
+                                            onDragStart = {
+                                                draggingKey = item.key
+                                                dragTranslation = Offset.Zero
+                                            },
+                                            onDrag = { amount ->
+                                                val list = itemsState.value
+                                                val from = list.indexOfFirst { it.key == item.key }
+                                                if (from < 0) return@ReorderableImageTile
+                                                val nextTranslation = dragTranslation + amount
+                                                val origin = Offset((from % 3) * stride, (from / 3) * stride)
+                                                val finger = origin + nextTranslation + Offset(cellPx / 2f, cellPx / 2f)
+                                                val targetCol = (finger.x / stride).toInt().coerceIn(0, 2)
+                                                val rowCount = ((list.size + 2) / 3).coerceAtLeast(1)
+                                                val targetRow = (finger.y / stride).toInt().coerceIn(0, rowCount - 1)
+                                                val target = (targetRow * 3 + targetCol).coerceIn(0, list.lastIndex)
+                                                if (target != from) {
+                                                    val moved = list.toMutableList()
+                                                    moved.add(target, moved.removeAt(from))
+                                                    onReorder(moved)
+                                                    val dCol = (target % 3) - (from % 3)
+                                                    val dRow = (target / 3) - (from / 3)
+                                                    dragTranslation = nextTranslation - Offset(dCol * stride, dRow * stride)
+                                                } else {
+                                                    dragTranslation = nextTranslation
+                                                }
+                                            },
+                                            onDragEnd = {
+                                                draggingKey = null
+                                                dragTranslation = Offset.Zero
+                                            }
+                                        )
                                     }
                                 }
                             }
@@ -1528,6 +1696,70 @@ fun MixedImageGrid(keptPaths: List<String>, newUris: List<Uri>,
                     }
                 }
             }
+        }
+    }
+}
+
+@Composable
+private fun ReorderableImageTile(
+    item: SheetImage,
+    dragging: Boolean,
+    translation: Offset,
+    onRemove: () -> Unit,
+    onDragStart: () -> Unit,
+    onDrag: (Offset) -> Unit,
+    onDragEnd: () -> Unit
+) {
+    val onDragStartState = rememberUpdatedState(onDragStart)
+    val onDragState = rememberUpdatedState(onDrag)
+    val onDragEndState = rememberUpdatedState(onDragEnd)
+    val model = when (item) {
+        is SheetImage.Kept -> File(item.path)
+        is SheetImage.Fresh -> item.uri
+    }
+    Box(
+        Modifier
+            .aspectRatio(1f)
+            .zIndex(if (dragging) 1f else 0f)
+            .graphicsLayer {
+                if (dragging) {
+                    translationX = translation.x
+                    translationY = translation.y
+                    scaleX = 1.06f
+                    scaleY = 1.06f
+                }
+            }
+    ) {
+        AsyncImage(
+            model = ImageRequest.Builder(LocalContext.current).data(model).crossfade(true).build(),
+            contentDescription = null,
+            modifier = Modifier
+                .fillMaxSize()
+                .clip(RoundedCornerShape(10.dp))
+                .pointerInput(item.key) {
+                    detectDragGesturesAfterLongPress(
+                        onDragStart = { onDragStartState.value() },
+                        onDrag = { change, amount ->
+                            change.consume()
+                            onDragState.value(amount)
+                        },
+                        onDragEnd = { onDragEndState.value() },
+                        onDragCancel = { onDragEndState.value() }
+                    )
+                },
+            contentScale = ContentScale.Crop
+        )
+        Box(
+            modifier = Modifier
+                .align(Alignment.TopEnd)
+                .padding(2.dp)
+                .size(24.dp)
+                .clip(CircleShape)
+                .background(Color.Black.copy(0.6f))
+                .clickable(onClick = onRemove),
+            contentAlignment = Alignment.Center
+        ) {
+            Icon(Icons.Default.Close, "移除", tint = Color.White, modifier = Modifier.size(14.dp))
         }
     }
 }
