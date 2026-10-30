@@ -35,6 +35,22 @@ interface NoteDao {
     /** 未分类笔记 */
     @Query("SELECT * FROM notes WHERE categoryId IS NULL ORDER BY id DESC")
     fun getUncategorizedNotes(): Flow<List<NoteEntity>>
+
+    @Query("SELECT * FROM notes WHERE categoryId IS NULL AND isDownloaded = 1 ORDER BY id DESC")
+    fun getDownloadedUncategorized(): Flow<List<NoteEntity>>
+
+    @Query("SELECT * FROM notes WHERE categoryId IS NULL AND isDownloaded = 0 ORDER BY id DESC")
+    fun getNotDownloadedUncategorized(): Flow<List<NoteEntity>>
+
+    @Query("""SELECT * FROM notes WHERE categoryId IS NULL AND
+        (name LIKE '%' || :q || '%' OR url LIKE '%' || :q || '%' OR remarks LIKE '%' || :q || '%')
+        ORDER BY id DESC""")
+    fun searchUncategorized(q: String): Flow<List<NoteEntity>>
+
+    @Query("""SELECT * FROM notes WHERE categoryId IS NULL AND isDownloaded = :dl AND
+        (name LIKE '%' || :q || '%' OR url LIKE '%' || :q || '%' OR remarks LIKE '%' || :q || '%')
+        ORDER BY id DESC""")
+    fun searchUncategorizedByDownload(q: String, dl: Boolean): Flow<List<NoteEntity>>
     
     /** 指定分类集合（自身 + 所有后代）的全部笔记 */
     @Query("SELECT * FROM notes WHERE categoryId IN (:categoryIds) ORDER BY id DESC")
