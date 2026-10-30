@@ -47,6 +47,7 @@ import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.input.pointer.PointerInputScope
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.positionChanged
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.Velocity
 import androidx.compose.ui.zIndex
@@ -82,6 +83,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.io.File
 import kotlin.math.abs
+import kotlin.math.roundToInt
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -1497,7 +1499,7 @@ fun NoteBottomSheet(
                     sheetImages = sheetImages.filter { image -> image.key != target.key }
                 }
             )
-            Text("长按图片可拖动排序，最多 9 张", fontSize = 11.sp, color = Color(0xFF55556A))
+            Text("长按后可自由拖动，松手放入新位置，最多 9 张", fontSize = 11.sp, color = Color(0xFF55556A))
 
             Spacer(modifier = Modifier.height(4.dp))
             Button(onClick = {
@@ -1634,6 +1636,12 @@ fun CategoryPickerDialog(tree: List<CategoryNode>, selectedId: Long?, onSelect: 
 // ═══════════════════════════════════════
 // 图片网格（旧路径 + 新URI 混合）
 // ═══════════════════════════════════════
+private data class ImageGridMetrics(
+    val cellPx: Float,
+    val stride: Float,
+    val count: Int
+)
+
 @Composable
 fun MixedImageGrid(
     items: List<SheetImage>,
@@ -1642,19 +1650,80 @@ fun MixedImageGrid(
     onRemove: (SheetImage) -> Unit
 ) {
     val itemsState = rememberUpdatedState(items)
-    var draggingKey by remember { mutableStateOf<String?>(null) }
-    var dragTranslation by remember { mutableStateOf(Offset.Zero) }
+    val onReorderState = rememberUpdatedState(onReorder)
+    var dragKey by remember { mutableStateOf<String?>(null) }
+    var originIndex by remember { mutableIntStateOf(-1) }
+    var hoverIndex by remember { mutableIntStateOf(-1) }
+    var dragTopLeft by remember { mutableStateOf(Offset.Zero) }
+    var pressInCell by remember { mutableStateOf(Offset.Zero) }
     val gap = 8.dp
-    BoxWithConstraints(Modifier.fillMaxWidth()) {
+    BoxWithConstraints(
+        Modifier
+            .fillMaxWidth()
+            .graphicsLayer { clip = false }
+    ) {
         val cell = (maxWidth - gap * 2) / 3
         val density = LocalDensity.current
         val cellPx = with(density) { cell.toPx() }
-        val gapPx = with(density) { gap.toPx() }
-        val stride = cellPx + gapPx
+        val stride = cellPx + with(density) { gap.toPx() }
+        val metricsState = rememberUpdatedState(ImageGridMetrics(cellPx, stride, items.size))
         val showAdd = items.size < 9
         val slotCount = items.size + if (showAdd) 1 else 0
         val rows = (slotCount + 2) / 3
-        Column(verticalArrangement = Arrangement.spacedBy(gap)) {
+        Column(
+            modifier = Modifier.pointerInput(Unit) {
+                var tracking = false
+                detectDragGesturesAfterLongPress(
+                    onDragStart = { start ->
+                        val metrics = metricsState.value
+                        val index = hitImageIndex(start, metrics)
+                        val list = itemsState.value
+                        if (index == null || index !in list.indices) {
+                            tracking = false
+                            return@detectDragGesturesAfterLongPress
+                        }
+                        tracking = true
+                        val origin = gridCellOrigin(index, metrics.stride)
+                        dragKey = list[index].key
+                        originIndex = index
+                        hoverIndex = index
+                        pressInCell = start - origin
+                        dragTopLeft = origin
+                    },
+                    onDrag = { change, amount ->
+                        if (!tracking) return@detectDragGesturesAfterLongPress
+                        change.consume()
+                        dragTopLeft += amount
+                        hoverIndex = dropImageIndex(dragTopLeft + pressInCell, metricsState.value)
+                    },
+                    onDragEnd = {
+                        if (tracking) {
+                            val from = originIndex
+                            val list = itemsState.value
+                            val target = hoverIndex
+                            if (from in list.indices && target in list.indices && from != target) {
+                                val moved = list.toMutableList()
+                                moved.add(target, moved.removeAt(from))
+                                onReorderState.value(moved)
+                            }
+                        }
+                        tracking = false
+                        dragKey = null
+                        originIndex = -1
+                        hoverIndex = -1
+                        dragTopLeft = Offset.Zero
+                    },
+                    onDragCancel = {
+                        tracking = false
+                        dragKey = null
+                        originIndex = -1
+                        hoverIndex = -1
+                        dragTopLeft = Offset.Zero
+                    }
+                )
+            },
+            verticalArrangement = Arrangement.spacedBy(gap)
+        ) {
             repeat(rows) { row ->
                 Row(horizontalArrangement = Arrangement.spacedBy(gap)) {
                     repeat(3) { col ->
@@ -1665,42 +1734,21 @@ fun MixedImageGrid(
                                 slot == items.size && showAdd -> AddImagePlaceholder(onClick = onAddClick)
                                 else -> {
                                     val item = items[slot]
-                                    key(item.key) {
-                                        ReorderableImageTile(
+                                    val draggingThis = dragKey == item.key
+                                    val targeted = dragKey != null && hoverIndex == slot && !draggingThis
+                                    if (draggingThis) {
+                                        Box(
+                                            Modifier
+                                                .aspectRatio(1f)
+                                                .clip(RoundedCornerShape(10.dp))
+                                                .background(Color(0xFF6C63FF).copy(0.10f))
+                                                .border(1.dp, Color(0xFF6C63FF).copy(0.45f), RoundedCornerShape(10.dp))
+                                        )
+                                    } else {
+                                        SheetImageTile(
                                             item = item,
-                                            dragging = draggingKey == item.key,
-                                            translation = if (draggingKey == item.key) dragTranslation else Offset.Zero,
-                                            onRemove = { onRemove(item) },
-                                            onDragStart = {
-                                                draggingKey = item.key
-                                                dragTranslation = Offset.Zero
-                                            },
-                                            onDrag = { amount ->
-                                                val list = itemsState.value
-                                                val from = list.indexOfFirst { it.key == item.key }
-                                                if (from < 0) return@ReorderableImageTile
-                                                val nextTranslation = dragTranslation + amount
-                                                val origin = Offset((from % 3) * stride, (from / 3) * stride)
-                                                val finger = origin + nextTranslation + Offset(cellPx / 2f, cellPx / 2f)
-                                                val targetCol = (finger.x / stride).toInt().coerceIn(0, 2)
-                                                val rowCount = ((list.size + 2) / 3).coerceAtLeast(1)
-                                                val targetRow = (finger.y / stride).toInt().coerceIn(0, rowCount - 1)
-                                                val target = (targetRow * 3 + targetCol).coerceIn(0, list.lastIndex)
-                                                if (target != from) {
-                                                    val moved = list.toMutableList()
-                                                    moved.add(target, moved.removeAt(from))
-                                                    onReorder(moved)
-                                                    val dCol = (target % 3) - (from % 3)
-                                                    val dRow = (target / 3) - (from / 3)
-                                                    dragTranslation = nextTranslation - Offset(dCol * stride, dRow * stride)
-                                                } else {
-                                                    dragTranslation = nextTranslation
-                                                }
-                                            },
-                                            onDragEnd = {
-                                                draggingKey = null
-                                                dragTranslation = Offset.Zero
-                                            }
+                                            highlighted = targeted,
+                                            onRemove = { onRemove(item) }
                                         )
                                     }
                                 }
@@ -1710,58 +1758,65 @@ fun MixedImageGrid(
                 }
             }
         }
+        val dragged = items.firstOrNull { it.key == dragKey }
+        if (dragged != null) {
+            SheetImageThumb(
+                item = dragged,
+                modifier = Modifier
+                    .offset { IntOffset(dragTopLeft.x.roundToInt(), dragTopLeft.y.roundToInt()) }
+                    .size(cell)
+                    .zIndex(8f)
+                    .graphicsLayer {
+                        scaleX = 1.12f
+                        scaleY = 1.12f
+                        shadowElevation = 18f
+                        shape = RoundedCornerShape(12.dp)
+                        clip = false
+                    }
+            )
+        }
     }
 }
 
+private fun gridCellOrigin(index: Int, stride: Float): Offset =
+    Offset((index % 3) * stride, (index / 3) * stride)
+
+private fun hitImageIndex(position: Offset, metrics: ImageGridMetrics): Int? {
+    if (position.x < 0f || position.y < 0f) return null
+    val col = (position.x / metrics.stride).toInt()
+    val row = (position.y / metrics.stride).toInt()
+    if (col !in 0..2 || row < 0) return null
+    val localX = position.x - col * metrics.stride
+    val localY = position.y - row * metrics.stride
+    if (localX > metrics.cellPx || localY > metrics.cellPx) return null
+    val index = row * 3 + col
+    return index.takeIf { it in 0 until metrics.count }
+}
+
+private fun dropImageIndex(position: Offset, metrics: ImageGridMetrics): Int {
+    if (metrics.count <= 0) return 0
+    val col = (position.x / metrics.stride).toInt().coerceIn(0, 2)
+    val rowCount = ((metrics.count + 2) / 3).coerceAtLeast(1)
+    val row = (position.y / metrics.stride).toInt().coerceIn(0, rowCount - 1)
+    return (row * 3 + col).coerceIn(0, metrics.count - 1)
+}
+
 @Composable
-private fun ReorderableImageTile(
+private fun SheetImageTile(
     item: SheetImage,
-    dragging: Boolean,
-    translation: Offset,
-    onRemove: () -> Unit,
-    onDragStart: () -> Unit,
-    onDrag: (Offset) -> Unit,
-    onDragEnd: () -> Unit
+    highlighted: Boolean,
+    onRemove: () -> Unit
 ) {
-    val onDragStartState = rememberUpdatedState(onDragStart)
-    val onDragState = rememberUpdatedState(onDrag)
-    val onDragEndState = rememberUpdatedState(onDragEnd)
-    val model = when (item) {
-        is SheetImage.Kept -> File(item.path)
-        is SheetImage.Fresh -> item.uri
-    }
     Box(
         Modifier
             .aspectRatio(1f)
-            .zIndex(if (dragging) 1f else 0f)
-            .graphicsLayer {
-                if (dragging) {
-                    translationX = translation.x
-                    translationY = translation.y
-                    scaleX = 1.06f
-                    scaleY = 1.06f
-                }
-            }
+            .clip(RoundedCornerShape(10.dp))
+            .then(
+                if (highlighted) Modifier.border(2.dp, Color(0xFF6C63FF), RoundedCornerShape(10.dp))
+                else Modifier
+            )
     ) {
-        AsyncImage(
-            model = ImageRequest.Builder(LocalContext.current).data(model).crossfade(true).build(),
-            contentDescription = null,
-            modifier = Modifier
-                .fillMaxSize()
-                .clip(RoundedCornerShape(10.dp))
-                .pointerInput(item.key) {
-                    detectDragGesturesAfterLongPress(
-                        onDragStart = { onDragStartState.value() },
-                        onDrag = { change, amount ->
-                            change.consume()
-                            onDragState.value(amount)
-                        },
-                        onDragEnd = { onDragEndState.value() },
-                        onDragCancel = { onDragEndState.value() }
-                    )
-                },
-            contentScale = ContentScale.Crop
-        )
+        SheetImageThumb(item = item, modifier = Modifier.fillMaxSize())
         Box(
             modifier = Modifier
                 .align(Alignment.TopEnd)
@@ -1775,6 +1830,20 @@ private fun ReorderableImageTile(
             Icon(Icons.Default.Close, "移除", tint = Color.White, modifier = Modifier.size(14.dp))
         }
     }
+}
+
+@Composable
+private fun SheetImageThumb(item: SheetImage, modifier: Modifier = Modifier) {
+    val model = when (item) {
+        is SheetImage.Kept -> File(item.path)
+        is SheetImage.Fresh -> item.uri
+    }
+    AsyncImage(
+        model = ImageRequest.Builder(LocalContext.current).data(model).crossfade(true).build(),
+        contentDescription = null,
+        modifier = modifier.clip(RoundedCornerShape(10.dp)),
+        contentScale = ContentScale.Crop
+    )
 }
 
 @Composable
