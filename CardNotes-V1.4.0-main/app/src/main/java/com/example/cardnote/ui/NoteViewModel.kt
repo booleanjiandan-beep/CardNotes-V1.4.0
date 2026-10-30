@@ -30,6 +30,24 @@ data class FilterState(
     val showAll: Boolean get() = showDownloaded == showNotDownloaded
 }
 
+/** 左侧分类筛选。只影响当前列表，不写入数据库。 */
+sealed interface NoteCategoryFilter {
+    data object All : NoteCategoryFilter
+    data object Uncategorized : NoteCategoryFilter
+    data class InCategory(val id: Long) : NoteCategoryFilter
+}
+
+/** 编辑页里的一张图片。列表顺序就是保存顺序。 */
+sealed class SheetImage {
+    abstract val key: String
+    data class Kept(val path: String) : SheetImage() {
+        override val key: String get() = "kept:$path"
+    }
+    data class Fresh(val uri: Uri) : SheetImage() {
+        override val key: String get() = "fresh:$uri"
+    }
+}
+
 // ── 分类树节点（UI 用） ──
 data class CategoryNode(
     val entity: CategoryEntity,
@@ -46,8 +64,9 @@ data class NoteUiState(
     val currentPagerIndex: Int = 0,
     // 分类
     val categoryTree: List<CategoryNode> = emptyList(),
-    val selectedCategoryId: Long? = null,   // null = 全部
+    val categoryFilter: NoteCategoryFilter = NoteCategoryFilter.All,
     val isCategoryDrawerOpen: Boolean = false,
+    val expandedCategoryIds: Set<Long> = emptySet(),
     val hiddenCategoryIds: Set<Long> = emptySet(),
     // sheets & dialogs
     val showAddSheet: Boolean = false,
@@ -96,7 +115,7 @@ private sealed class PendingSaveAction {
         val url: String,
         val isDownloaded: Boolean,
         val remarks: String,
-        val imageUris: List<Uri>,
+        val images: List<SheetImage>,
         val categoryId: Long?
     ) : PendingSaveAction()
 
@@ -106,15 +125,19 @@ private sealed class PendingSaveAction {
         val url: String,
         val isDownloaded: Boolean,
         val remarks: String,
-        val keptPaths: List<String>,
-        val newUris: List<Uri>,
+        val images: List<SheetImage>,
         val categoryId: Long?
     ) : PendingSaveAction()
 }
 
 // private data class QueryKey(val catId: Long?, val filter: FilterState, val search: String)
 // 改为携带 id 列表
-private data class QueryKey(val categoryIds: List<Long>?, val filter: FilterState, val search: String)
+private data class QueryKey(
+    val categoryIds: List<Long>?,
+    val uncategorizedOnly: Boolean,
+    val filter: FilterState,
+    val search: String
+)
 
 @OptIn(ExperimentalCoroutinesApi::class, FlowPreview::class)
 class NoteViewModel(application: Application) : AndroidViewModel(application) {
@@ -122,11 +145,14 @@ class NoteViewModel(application: Application) : AndroidViewModel(application) {
         private const val SIMILARITY_THRESHOLD = 0.78
         private const val EXPORT_NOTES_JSON = "notes.json"
         private const val EXPORT_ASSETS_DIR = "assets/"
+        private const val UI_PREFS = "cardnote_ui_prefs"
+        private const val KEY_EXPANDED_CATEGORIES = "expanded_category_ids"
     }
 
     private val noteRepo: NoteRepository
     private val catRepo:  CategoryRepository
     private val appCtx = application.applicationContext
+    private val uiPrefs = appCtx.getSharedPreferences(UI_PREFS, Context.MODE_PRIVATE)
 
     private val _filterState = MutableStateFlow(FilterState())
     val filterState: StateFlow<FilterState> = _filterState.asStateFlow()
@@ -201,6 +227,7 @@ class NoteViewModel(application: Application) : AndroidViewModel(application) {
         val db = NoteDatabase.getDatabase(application)
         noteRepo = NoteRepository(db.noteDao())
         catRepo  = CategoryRepository(db.categoryDao())
+        _uiState.update { it.copy(expandedCategoryIds = readExpandedCategoryIds()) }
 
         // 监听分类树
         viewModelScope.launch {
@@ -212,17 +239,21 @@ class NoteViewModel(application: Application) : AndroidViewModel(application) {
         // 监听笔记（catId + filter + search + hidden 合并）
         viewModelScope.launch {
             combine(
-                _uiState.map { it.selectedCategoryId }.distinctUntilChanged(),
+                _uiState.map { it.categoryFilter }.distinctUntilChanged(),
                 _uiState.map { it.categoryTree }.distinctUntilChanged(),
                 _filterState,
                 _searchQuery,
                 _uiState.map { it.hiddenCategoryIds }.distinctUntilChanged()
-            ) { catId, tree, filter, search, hidden ->
-                val ids = if (catId == null) null else collectIds(tree, catId)
-                QueryKey(ids, filter, search) to expandHiddenCategoryIds(hidden, tree)
+            ) { categoryFilter, tree, filter, search, hidden ->
+                val (ids, uncategorizedOnly) = when (categoryFilter) {
+                    NoteCategoryFilter.All -> null to false
+                    NoteCategoryFilter.Uncategorized -> null to true
+                    is NoteCategoryFilter.InCategory -> collectIds(tree, categoryFilter.id) to false
+                }
+                QueryKey(ids, uncategorizedOnly, filter, search) to expandHiddenCategoryIds(hidden, tree)
             }
                 .flatMapLatest { (key, excludedIds) ->
-                    noteRepo.queryNotes(key.categoryIds, key.filter, key.search)
+                    noteRepo.queryNotes(key.categoryIds, key.uncategorizedOnly, key.filter, key.search)
                         .map { notes ->
                             notes.filter { note ->
                                 val categoryId = note.categoryId ?: return@filter true
@@ -386,8 +417,25 @@ class NoteViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     // ── 分类操作 ──
-    fun selectCategory(id: Long?) {
-        _uiState.update { it.copy(selectedCategoryId = id, currentPagerIndex = 0) }
+    fun selectAllNotes() {
+        _uiState.update { it.copy(categoryFilter = NoteCategoryFilter.All, currentPagerIndex = 0) }
+    }
+    fun selectUncategorized() {
+        _uiState.update { it.copy(categoryFilter = NoteCategoryFilter.Uncategorized, currentPagerIndex = 0) }
+    }
+    fun selectCategory(id: Long) {
+        _uiState.update { it.copy(categoryFilter = NoteCategoryFilter.InCategory(id), currentPagerIndex = 0) }
+    }
+    fun toggleCategoryExpanded(categoryId: Long) {
+        _uiState.update { state ->
+            val updated = if (categoryId in state.expandedCategoryIds) {
+                state.expandedCategoryIds - categoryId
+            } else {
+                state.expandedCategoryIds + categoryId
+            }
+            writeExpandedCategoryIds(updated)
+            state.copy(expandedCategoryIds = updated)
+        }
     }
     fun toggleCategoryDrawer() {
         _uiState.update { it.copy(isCategoryDrawerOpen = !it.isCategoryDrawerOpen) }
@@ -435,7 +483,7 @@ class NoteViewModel(application: Application) : AndroidViewModel(application) {
             val categoryIds = collectIds(tree, cat.id) ?: listOf(cat.id)
 
             val allFilter = FilterState(showDownloaded = true, showNotDownloaded = true)
-            val notesToDelete = noteRepo.queryNotes(categoryIds, allFilter, "").first()
+            val notesToDelete = noteRepo.queryNotes(categoryIds, false, allFilter, "").first()
 
             notesToDelete.forEach { note ->
                 ImageStorageManager.deleteImages(note.images)
@@ -444,8 +492,15 @@ class NoteViewModel(application: Application) : AndroidViewModel(application) {
 
             catRepo.delete(cat)
 
-            if (_uiState.value.selectedCategoryId == cat.id) {
-                _uiState.update { it.copy(selectedCategoryId = null) }
+            _uiState.update { state ->
+                val filter = state.categoryFilter
+                val stillSelected = filter is NoteCategoryFilter.InCategory && filter.id in categoryIds
+                val expanded = state.expandedCategoryIds - categoryIds.toSet()
+                writeExpandedCategoryIds(expanded)
+                state.copy(
+                    categoryFilter = if (stillSelected) NoteCategoryFilter.All else filter,
+                    expandedCategoryIds = expanded
+                )
             }
             // 不再显示任何 Snackbar
         }
@@ -487,7 +542,7 @@ class NoteViewModel(application: Application) : AndroidViewModel(application) {
         url: String,
         isDownloaded: Boolean,
         remarks: String,
-        imageUris: List<Uri>,
+        images: List<SheetImage>,
         categoryId: Long?
     ) {
         viewModelScope.launch {
@@ -512,7 +567,7 @@ class NoteViewModel(application: Application) : AndroidViewModel(application) {
                             url = url,
                             isDownloaded = isDownloaded,
                             remarks = remarks,
-                            imageUris = imageUris,
+                            images = images,
                             categoryId = categoryId
                         )
                         _uiState.update {
@@ -526,7 +581,7 @@ class NoteViewModel(application: Application) : AndroidViewModel(application) {
                     }
                     ConflictType.NONE -> Unit
                 }
-                val paths = ImageStorageManager.copyAllToPrivateStorage(appCtx, imageUris)
+                val paths = resolveImagePaths(images)
                 noteRepo.insertNote(NoteEntity(name = name.trim(), url = url.trim(),
                     isDownloaded = isDownloaded, remarks = remarks.trim(),
                     images = paths, categoryId = categoryId))
@@ -546,8 +601,7 @@ class NoteViewModel(application: Application) : AndroidViewModel(application) {
         url: String,
         isDownloaded: Boolean,
         remarks: String,
-        keptPaths: List<String>,
-        newUris: List<Uri>,
+        images: List<SheetImage>,
         categoryId: Long?
     ) {
         viewModelScope.launch {
@@ -573,8 +627,7 @@ class NoteViewModel(application: Application) : AndroidViewModel(application) {
                             url = url,
                             isDownloaded = isDownloaded,
                             remarks = remarks,
-                            keptPaths = keptPaths,
-                            newUris = newUris,
+                            images = images,
                             categoryId = categoryId
                         )
                         _uiState.update {
@@ -588,12 +641,10 @@ class NoteViewModel(application: Application) : AndroidViewModel(application) {
                     }
                     ConflictType.NONE -> Unit
                 }
-                val removed = note.images - keptPaths.toSet()
-                ImageStorageManager.deleteImages(removed)
-                val newPaths = ImageStorageManager.copyAllToPrivateStorage(appCtx, newUris)
+                val paths = applyEditedImages(note.images, images)
                 noteRepo.updateNote(note.copy(name = name.trim(), url = url.trim(),
                     isDownloaded = isDownloaded, remarks = remarks.trim(),
-                    images = (keptPaths + newPaths).take(9), categoryId = categoryId))
+                    images = paths, categoryId = categoryId))
                 _uiState.update { it.copy(noteToEdit = null) }
             } catch (e: Exception) {
                 _uiState.update { it.copy(snackbarMessage = "保存失败：${e.message}") }
@@ -609,7 +660,7 @@ class NoteViewModel(application: Application) : AndroidViewModel(application) {
             try {
                 when (action) {
                     is PendingSaveAction.Add -> {
-                        val paths = ImageStorageManager.copyAllToPrivateStorage(appCtx, action.imageUris)
+                        val paths = resolveImagePaths(action.images)
                         noteRepo.insertNote(
                             NoteEntity(
                                 name = action.name.trim(),
@@ -623,16 +674,14 @@ class NoteViewModel(application: Application) : AndroidViewModel(application) {
                         _uiState.update { it.copy(showAddSheet = false) }
                     }
                     is PendingSaveAction.Edit -> {
-                        val removed = action.note.images - action.keptPaths.toSet()
-                        ImageStorageManager.deleteImages(removed)
-                        val newPaths = ImageStorageManager.copyAllToPrivateStorage(appCtx, action.newUris)
+                        val paths = applyEditedImages(action.note.images, action.images)
                         noteRepo.updateNote(
                             action.note.copy(
                                 name = action.name.trim(),
                                 url = action.url.trim(),
                                 isDownloaded = action.isDownloaded,
                                 remarks = action.remarks.trim(),
-                                images = (action.keptPaths + newPaths).take(9),
+                                images = paths,
                                 categoryId = action.categoryId
                             )
                         )
@@ -922,7 +971,11 @@ class NoteViewModel(application: Application) : AndroidViewModel(application) {
             } else emptyList()
             _uiState.update {
                 it.copy(
-                    selectedCategoryId = categoryId,
+                    categoryFilter = if (categoryId == null) {
+                        NoteCategoryFilter.Uncategorized
+                    } else {
+                        NoteCategoryFilter.InCategory(categoryId)
+                    },
                     hiddenCategoryIds = it.hiddenCategoryIds - toUnhide.toSet(),
                     isSearchActive = false,
                     searchQuery = ""
@@ -949,6 +1002,36 @@ class NoteViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun clearSnackbar() { _uiState.update { it.copy(snackbarMessage = null) } }
+
+    private fun readExpandedCategoryIds(): Set<Long> {
+        val raw = uiPrefs.getStringSet(KEY_EXPANDED_CATEGORIES, emptySet()) ?: emptySet()
+        return raw.mapNotNull { it.toLongOrNull() }.toSet()
+    }
+
+    private fun writeExpandedCategoryIds(ids: Set<Long>) {
+        uiPrefs.edit()
+            .putStringSet(KEY_EXPANDED_CATEGORIES, ids.map { it.toString() }.toSet())
+            .apply()
+    }
+
+    private suspend fun resolveImagePaths(slots: List<SheetImage>): List<String> {
+        val paths = ArrayList<String>(slots.size)
+        for (slot in slots.take(9)) {
+            when (slot) {
+                is SheetImage.Kept -> paths.add(slot.path)
+                is SheetImage.Fresh -> {
+                    ImageStorageManager.copyToPrivateStorage(appCtx, slot.uri)?.let { paths.add(it) }
+                }
+            }
+        }
+        return paths
+    }
+
+    private suspend fun applyEditedImages(previous: List<String>, slots: List<SheetImage>): List<String> {
+        val kept = slots.filterIsInstance<SheetImage.Kept>().map { it.path }.toSet()
+        ImageStorageManager.deleteImages(previous.filter { it !in kept })
+        return resolveImagePaths(slots)
+    }
 
     private data class ImportPayload(
         val root: JSONObject,
