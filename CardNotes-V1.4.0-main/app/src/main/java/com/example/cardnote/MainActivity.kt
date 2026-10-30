@@ -1395,22 +1395,33 @@ fun NoteBottomSheet(
     var nameError    by remember { mutableStateOf(false) }
     var showImgSrc   by remember { mutableStateOf(false) }
     var sheetImages by remember {
-        mutableStateOf(existingNote?.images?.map { SheetImage.Kept(it) } ?: emptyList())
+        mutableStateOf<List<SheetImage>>(
+            existingNote?.images.orEmpty().map { path -> SheetImage.Kept(path) }
+        )
     }
     var selectedCat  by remember { mutableStateOf(initialCategoryId) }
     var showCatPicker by remember { mutableStateOf(false) }
 
-    fun totalImageCount() = sheetImages.size
+    fun totalImageCount(): Int = sheetImages.size
 
     var cameraUri by remember { mutableStateOf<Uri?>(null) }
     val galleryLauncher = rememberLauncherForActivityResult(ActivityResultContracts.GetMultipleContents()) { uris ->
-        val canAdd = (9 - totalImageCount()).coerceAtLeast(0)
-        val existing = sheetImages.filterIsInstance<SheetImage.Fresh>().map { it.uri }.toSet()
-        val added = uris.filter { it !in existing }.take(canAdd).map { SheetImage.Fresh(it) }
+        val canAdd = (9 - sheetImages.size).coerceAtLeast(0)
+        val existingUris = sheetImages.mapNotNull { image ->
+            (image as? SheetImage.Fresh)?.uri
+        }.toSet()
+        val added = uris.filter { uri -> uri !in existingUris }
+            .take(canAdd)
+            .map { uri -> SheetImage.Fresh(uri) }
         sheetImages = sheetImages + added
     }
     val cameraLauncher = rememberLauncherForActivityResult(ActivityResultContracts.TakePicture()) { success ->
-        if (success) cameraUri?.let { if (totalImageCount() < 9) sheetImages = sheetImages + SheetImage.Fresh(it) }
+        if (success) {
+            val captured = cameraUri
+            if (captured != null && sheetImages.size < 9) {
+                sheetImages = sheetImages + SheetImage.Fresh(captured)
+            }
+        }
     }
     val cameraPermLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
         if (granted) { val f = File(context.cacheDir, "photo_${System.currentTimeMillis()}.jpg")
@@ -1482,7 +1493,9 @@ fun NoteBottomSheet(
                 items = sheetImages,
                 onReorder = { sheetImages = it },
                 onAddClick = { showImgSrc = true },
-                onRemove = { target -> sheetImages = sheetImages.filterNot { it.key == target.key } }
+                onRemove = { target ->
+                    sheetImages = sheetImages.filter { image -> image.key != target.key }
+                }
             )
             Text("长按图片可拖动排序，最多 9 张", fontSize = 11.sp, color = Color(0xFF55556A))
 
