@@ -11,11 +11,22 @@ class NoteRepository(private val dao: NoteDao) {
 
     /** 根据分类 + 下载筛选 + 搜索词，返回对应 Flow */
     fun queryNotes(
-        categoryIds: List<Long>?,   // ← 改为列表
+        categoryIds: List<Long>?,
+        uncategorizedOnly: Boolean,
         filter: FilterState,
         search: String
     ): Flow<List<NoteEntity>> {
         val q = search.trim()
+        if (uncategorizedOnly) {
+            return when {
+                q.isNotBlank() && filter.showAll -> dao.searchUncategorized(q)
+                q.isNotBlank() && filter.showDownloaded -> dao.searchUncategorizedByDownload(q, true)
+                q.isNotBlank() -> dao.searchUncategorizedByDownload(q, false)
+                filter.showAll -> dao.getUncategorizedNotes()
+                filter.showDownloaded -> dao.getDownloadedUncategorized()
+                else -> dao.getNotDownloadedUncategorized()
+            }
+        }
         return when {
             q.isNotBlank() && categoryIds != null -> when {
                 filter.showAll        -> dao.searchByCategoryIds(q, categoryIds)
